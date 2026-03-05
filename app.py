@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import streamlit as st
+import markdown
 from datetime import datetime
 
 # Add parent dir to path so imports work
@@ -121,6 +122,13 @@ with tab_company:
                     data=md,
                     file_name=f"{ticker.upper()}_report.md",
                     mime="text/markdown",
+                )
+            html = markdown.markdown(md, extensions=["tables", "fenced_code"])
+            st.download_button(
+                "🌐 Download HTML (Open in Browser)",
+                data=html,
+                file_name=f"{ticker.upper()}_report.html",
+                mime="text/html",
                 )
 
             # Save to output/
