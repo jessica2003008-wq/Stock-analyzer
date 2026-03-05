@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from data.schemas import IndustryReport, CompanyReport
-from data.fmp_client import FMPClient
+from data.yfinance_client import YFinanceClient
 from data.edgar_client import EdgarClient
 from llm.claude_client import ClaudeClient
 from industry.universe import build_universe
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 def run_industry_analysis(
     industry: str,
-    fmp: FMPClient,
+    data_client: YFinanceClient,
     llm: ClaudeClient | None = None,
     edgar: EdgarClient | None = None,
     n: int = 20,
@@ -37,7 +37,7 @@ def run_industry_analysis(
 
     # ── Build Universe ──
     _progress(f"Building universe for {industry}...")
-    universe = build_universe(industry, fmp, n, sort_by, min_market_cap)
+    universe = build_universe(industry, data_client, n, sort_by, min_market_cap)
 
     if not universe.companies:
         return IndustryReport(
@@ -58,7 +58,7 @@ def run_industry_analysis(
         try:
             report = run_company_analysis(
                 ticker=company.ticker,
-                fmp=fmp,
+                data_client=data_client,
                 llm=llm,
                 edgar=edgar,
                 discount_rate=discount_rate,

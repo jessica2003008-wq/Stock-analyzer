@@ -1,7 +1,7 @@
 """Industry universe identification."""
 from __future__ import annotations
 import logging
-from data.fmp_client import FMPClient
+from data.yfinance_client import YFinanceClient
 from data.schemas import UniverseResult
 
 logger = logging.getLogger(__name__)
@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 def build_universe(
     industry: str,
-    fmp: FMPClient,
+    data_client: YFinanceClient,
     n: int = 20,
     sort_by: str = "market_cap",
     min_market_cap: float = 1_000_000_000,
@@ -17,7 +17,7 @@ def build_universe(
     """Identify top N companies in an industry."""
     logger.info(f"Building universe for {industry}: top {n} by {sort_by}")
 
-    companies = fmp.screen_by_industry(
+    companies = data_client.screen_by_industry(
         industry=industry,
         sort_by=sort_by,
         limit=n,

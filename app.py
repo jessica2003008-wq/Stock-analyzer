@@ -10,7 +10,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
-from data.fmp_client import FMPClient, FMPError
+from data.yfinance_client import YFinanceClient, YFinanceError
 from data.edgar_client import EdgarClient
 from llm.claude_client import ClaudeClient, LLMError
 from reports.company_report import run_company_analysis, report_to_json, report_to_markdown
@@ -30,18 +30,13 @@ with st.sidebar:
     st.header("⚙️ Configuration")
 
     st.subheader("API Keys")
-    fmp_key = st.text_input(
-        "FMP API Key",
-        value=config.FMP_API_KEY,
-        type="password",
-        help="Financial Modeling Prep API key. Set via env var FMP_API_KEY or enter here.",
-    )
     anthropic_key = st.text_input(
         "Anthropic API Key",
         value=config.ANTHROPIC_API_KEY,
         type="password",
         help="Anthropic Claude API key. Set via env var ANTHROPIC_API_KEY or enter here.",
     )
+    st.info("📊 Financial data powered by yfinance (free, no API key needed)")
 
     st.divider()
     st.subheader("Valuation Parameters")
@@ -64,11 +59,6 @@ with st.sidebar:
     min_stab = st.slider("Min Stability Score", 0, 100, config.MIN_STABILITY_SCORE)
 
     use_edgar = st.checkbox("Fetch SEC EDGAR filings", value=True)
-
-# ── Validate Keys ──
-if not fmp_key:
-    st.error("❌ FMP API Key is required. Set it via env var `FMP_API_KEY` or enter in the sidebar.")
-    st.stop()
 
 # ── Main Interface ──
 tab_company, tab_industry = st.tabs(["📊 Company Analysis", "🏭 Industry Analysis"])
@@ -96,7 +86,7 @@ with tab_company:
             progress.info(msg)
 
         try:
-            fmp = FMPClient(api_key=fmp_key)
+            data_client = YFinanceClient()
             llm = None
             if anthropic_key:
                 try:
@@ -108,7 +98,7 @@ with tab_company:
 
             report = run_company_analysis(
                 ticker=ticker,
-                fmp=fmp,
+                data_client=data_client,
                 llm=llm,
                 edgar=edgar,
                 discount_rate=discount_rate,
@@ -148,8 +138,8 @@ with tab_company:
             with open(os.path.join(output_dir, f"{ticker.upper()}_report.md"), "w") as f:
                 f.write(md)
 
-        except FMPError as e:
-            st.error(f"❌ FMP Error: {e}")
+        except YFinanceError as e:
+            st.error(f"❌ Data Error: {e}")
         except RuntimeError as e:
             st.error(f"❌ {e}")
         except Exception as e:
@@ -182,7 +172,7 @@ with tab_industry:
             progress.info(msg)
 
         try:
-            fmp = FMPClient(api_key=fmp_key)
+            data_client = YFinanceClient()
             llm = None
             if anthropic_key:
                 try:
@@ -194,7 +184,7 @@ with tab_industry:
 
             report = run_industry_analysis(
                 industry=industry,
-                fmp=fmp,
+                data_client=data_client,
                 llm=llm,
                 edgar=edgar,
                 n=universe_size,
@@ -244,8 +234,8 @@ with tab_industry:
             with open(os.path.join(output_dir, f"{safe_name}_industry.md"), "w") as f:
                 f.write(md)
 
-        except FMPError as e:
-            st.error(f"❌ FMP Error: {e}")
+        except YFinanceError as e:
+            st.error(f"❌ Data Error: {e}")
         except Exception as e:
             st.error(f"❌ Unexpected error: {e}")
             st.exception(e)

@@ -6,7 +6,7 @@ from datetime import datetime
 from data.schemas import (
     FinancialHistory, FilingText, CompanyReport,
 )
-from data.fmp_client import FMPClient
+from data.yfinance_client import YFinanceClient
 from data.edgar_client import EdgarClient
 from llm.claude_client import ClaudeClient, LLMError
 from analysis.circle_of_competence import analyze_circle_of_competence
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 def run_company_analysis(
     ticker: str,
-    fmp: FMPClient,
+    data_client: YFinanceClient,
     llm: ClaudeClient | None = None,
     edgar: EdgarClient | None = None,
     discount_rate: float | None = None,
@@ -42,7 +42,7 @@ def run_company_analysis(
     # ── Data Fetch ──
     _progress(f"[{ticker}] Fetching financial data...")
     try:
-        history = fmp.get_financial_history(ticker)
+        history = data_client.get_financial_history(ticker)
     except Exception as e:
         raise RuntimeError(f"Failed to fetch financial data for {ticker}: {e}")
 
@@ -61,10 +61,10 @@ def run_company_analysis(
         try:
             filing = edgar.get_latest_10k_text(ticker)
             if not filing.sections:
-                warnings.append("EDGAR 10-K text not found; using FMP business description instead")
+                warnings.append("EDGAR 10-K text not found; using yfinance business description instead")
                 filing = None
         except Exception as e:
-            warnings.append(f"EDGAR fetch failed: {e}; using FMP data only")
+            warnings.append(f"EDGAR fetch failed: {e}; using yfinance data only")
             filing = None
 
     # ── Step 1: Circle of Competence ──
