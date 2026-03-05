@@ -1,6 +1,7 @@
 """Company report assembly — runs all analysis modules and generates JSON + Markdown."""
 from __future__ import annotations
 import json
+import config
 import logging
 from datetime import datetime
 from data.schemas import (
