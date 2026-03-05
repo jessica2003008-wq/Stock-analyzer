@@ -29,14 +29,6 @@ st.caption("AI-powered investment research modeled on Berkshire Hathaway's analy
 with st.sidebar:
     st.header("⚙️ Configuration")
 
-    st.subheader("API Keys")
-    anthropic_key = st.text_input(
-        "Anthropic API Key",
-        value=config.ANTHROPIC_API_KEY,
-        type="password",
-        help="Anthropic Claude API key. Set via env var ANTHROPIC_API_KEY or enter here.",
-    )
-    st.info("📊 Financial data powered by yfinance (free, no API key needed)")
 
     st.divider()
     st.subheader("Valuation Parameters")
