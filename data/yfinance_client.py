@@ -163,7 +163,6 @@ SEED_INDUSTRIES: Dict[str, List[str]] = {
         "JNJ", "PFE", "MRK", "ABBV", "LLY",
         "BMY", "AMGN", "TMO", "DHR", "SYK",
         "MDT", "BSX", "ISRG", "GILD", "REGN",
-        "VRTX", "BIIB", "HCA", "UHS", "CNC",
     ],
     "semiconductors": [
         "NVDA", "AMD", "AVGO", "INTC", "TSM",
