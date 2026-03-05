@@ -10,6 +10,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
+anthropic_key = st.secrets.get("ANTHROPIC_API_KEY", "")
 from data.yfinance_client import YFinanceClient, YFinanceError
 from data.edgar_client import EdgarClient
 from llm.claude_client import ClaudeClient, LLMError
