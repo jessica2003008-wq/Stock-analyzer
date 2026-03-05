@@ -169,7 +169,7 @@ with tab_company:
             md = report_to_markdown(report)
             st.markdown(md)
 
-            # Downloads (JSON / Markdown / HTML Pretty)
+            # Downloads (JSON / Markdown / HTML)
             col_dl1, col_dl2 = st.columns(2)
             with col_dl1:
                 st.download_button(
@@ -188,7 +188,7 @@ with tab_company:
 
                 html_doc = md_to_styled_html(md, title=f"{ticker.upper()} Buffett Report")
                 st.download_button(
-                    "🌐 Download HTML (Pretty)",
+                    "🌐 Download HTML",
                     data=html_doc,
                     file_name=f"{ticker.upper()}_report.html",
                     mime="text/html",
