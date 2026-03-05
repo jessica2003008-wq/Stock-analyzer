@@ -1,22 +1,83 @@
 """Buffett Analyzer — Streamlit UI."""
 from __future__ import annotations
+
 import os
+import sys
 import json
-import streamlit as st
-import markdown
 from datetime import datetime
 
+import streamlit as st
+import markdown
+
 # Add parent dir to path so imports work
-import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
-anthropic_key = st.secrets.get("ANTHROPIC_API_KEY", "")
 from data.yfinance_client import YFinanceClient, YFinanceError
 from data.edgar_client import EdgarClient
 from llm.claude_client import ClaudeClient, LLMError
 from reports.company_report import run_company_analysis, report_to_json, report_to_markdown
 from reports.industry_report_gen import run_industry_analysis, industry_report_to_markdown
+
+anthropic_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+
+
+def md_to_styled_html(md_text: str, title: str = "Buffett Analyzer Report") -> str:
+    """Convert Markdown to a standalone, styled HTML document (pretty in browser)."""
+    body = markdown.markdown(md_text, extensions=["tables", "fenced_code"])
+
+    css = """
+    body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial;
+        margin: 40px;
+        color: #111;
+        line-height: 1.55;
+        max-width: 980px;
+    }
+    h1, h2, h3 { margin-top: 28px; }
+    h1 { font-size: 28px; }
+    h2 { font-size: 22px; }
+    h3 { font-size: 18px; }
+
+    code { background: #f6f8fa; padding: 2px 5px; border-radius: 4px; }
+    pre {
+        background: #f6f8fa;
+        padding: 12px;
+        border-radius: 8px;
+        overflow-x: auto;
+    }
+    pre code { background: transparent; padding: 0; }
+
+    table { border-collapse: collapse; width: 100%; margin: 14px 0; }
+    th, td { border: 1px solid #d0d7de; padding: 8px; text-align: left; vertical-align: top; }
+    th { background: #f6f8fa; }
+
+    hr { border: none; border-top: 1px solid #d0d7de; margin: 24px 0; }
+
+    blockquote {
+        border-left: 4px solid #d0d7de;
+        padding-left: 12px;
+        color: #444;
+        margin-left: 0;
+    }
+
+    /* small badge look for emphasis lines */
+    strong { font-weight: 700; }
+    """
+
+    return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>{css}</style>
+</head>
+<body>
+{body}
+</body>
+</html>"""
+
 
 st.set_page_config(
     page_title="Buffett Analyzer",
@@ -31,7 +92,6 @@ st.caption("AI-powered investment research modeled on Berkshire Hathaway's analy
 with st.sidebar:
     st.header("⚙️ Configuration")
 
-
     st.divider()
     st.subheader("Valuation Parameters")
     projection_years = st.slider("Projection Years", 5, 15, config.PROJECTION_YEARS)
@@ -42,9 +102,9 @@ with st.sidebar:
     st.subheader("Industry Settings")
     universe_size = st.slider("Universe Size (N)", 5, 50, config.DEFAULT_UNIVERSE_SIZE)
     sort_method = st.selectbox("Sort By", ["market_cap", "revenue"])
-    min_mcap = st.number_input(
-        "Min Market Cap ($B)", value=config.MIN_MARKET_CAP / 1e9, min_value=0.1, step=0.5
-    ) * 1e9
+    min_mcap = (
+        st.number_input("Min Market Cap ($B)", value=config.MIN_MARKET_CAP / 1e9, min_value=0.1, step=0.5) * 1e9
+    )
 
     st.divider()
     st.subheader("Hard Filter Thresholds")
@@ -60,6 +120,7 @@ tab_company, tab_industry = st.tabs(["📊 Company Analysis", "🏭 Industry Ana
 with tab_company:
     st.subheader("Single Company Analysis")
     col1, col2 = st.columns([3, 1])
+
     with col1:
         ticker = st.text_input("Enter ticker symbol", placeholder="AAPL", key="company_ticker")
     with col2:
@@ -74,9 +135,8 @@ with tab_company:
         config.MIN_STABILITY_SCORE = min_stab
 
         progress = st.empty()
-        status_container = st.container()
 
-        def company_progress(msg):
+        def company_progress(msg: str):
             progress.info(msg)
 
         try:
@@ -101,13 +161,15 @@ with tab_company:
                 progress_callback=company_progress,
             )
 
-            progress.success(f"✅ Analysis complete: {report.recommendation.action} ({report.recommendation.position_size})")
+            progress.success(
+                f"✅ Analysis complete: {report.recommendation.action} ({report.recommendation.position_size})"
+            )
 
             # Display report
             md = report_to_markdown(report)
             st.markdown(md)
 
-            # Downloads
+            # Downloads (JSON / Markdown / HTML Pretty)
             col_dl1, col_dl2 = st.columns(2)
             with col_dl1:
                 st.download_button(
@@ -123,21 +185,24 @@ with tab_company:
                     file_name=f"{ticker.upper()}_report.md",
                     mime="text/markdown",
                 )
-            html = markdown.markdown(md, extensions=["tables", "fenced_code"])
-            st.download_button(
-                "🌐 Download HTML (Open in Browser)",
-                data=html,
-                file_name=f"{ticker.upper()}_report.html",
-                mime="text/html",
+
+                html_doc = md_to_styled_html(md, title=f"{ticker.upper()} Buffett Report")
+                st.download_button(
+                    "🌐 Download HTML (Pretty)",
+                    data=html_doc,
+                    file_name=f"{ticker.upper()}_report.html",
+                    mime="text/html",
                 )
 
             # Save to output/
             output_dir = os.path.join(os.path.dirname(__file__), "output")
             os.makedirs(output_dir, exist_ok=True)
-            with open(os.path.join(output_dir, f"{ticker.upper()}_report.json"), "w") as f:
+            with open(os.path.join(output_dir, f"{ticker.upper()}_report.json"), "w", encoding="utf-8") as f:
                 f.write(report_to_json(report))
-            with open(os.path.join(output_dir, f"{ticker.upper()}_report.md"), "w") as f:
+            with open(os.path.join(output_dir, f"{ticker.upper()}_report.md"), "w", encoding="utf-8") as f:
                 f.write(md)
+            with open(os.path.join(output_dir, f"{ticker.upper()}_report.html"), "w", encoding="utf-8") as f:
+                f.write(html_doc)
 
         except YFinanceError as e:
             st.error(f"❌ Data Error: {e}")
@@ -150,6 +215,7 @@ with tab_company:
 with tab_industry:
     st.subheader("Industry Analysis")
     col1, col2 = st.columns([3, 1])
+
     with col1:
         industry = st.text_input(
             "Enter industry name",
@@ -167,9 +233,8 @@ with tab_industry:
         config.MIN_STABILITY_SCORE = min_stab
 
         progress = st.empty()
-        status_text = st.empty()
 
-        def industry_progress(msg):
+        def industry_progress(msg: str):
             progress.info(msg)
 
         try:
@@ -208,10 +273,11 @@ with tab_industry:
             md = industry_report_to_markdown(report)
             st.markdown(md)
 
-            # Downloads
+            # Downloads (JSON / Markdown / HTML Pretty)
             col_dl1, col_dl2 = st.columns(2)
             json_data = report.model_dump_json(indent=2)
             safe_name = industry.replace(" ", "_").replace("/", "_")
+
             with col_dl1:
                 st.download_button(
                     "📥 Download JSON",
@@ -227,20 +293,29 @@ with tab_industry:
                     mime="text/markdown",
                 )
 
+                html_doc = md_to_styled_html(md, title=f"{safe_name} Industry Report")
+                st.download_button(
+                    "🌐 Download HTML (Pretty)",
+                    data=html_doc,
+                    file_name=f"{safe_name}_industry.html",
+                    mime="text/html",
+                )
+
             # Save
             output_dir = os.path.join(os.path.dirname(__file__), "output")
             os.makedirs(output_dir, exist_ok=True)
-            with open(os.path.join(output_dir, f"{safe_name}_industry.json"), "w") as f:
+            with open(os.path.join(output_dir, f"{safe_name}_industry.json"), "w", encoding="utf-8") as f:
                 f.write(json_data)
-            with open(os.path.join(output_dir, f"{safe_name}_industry.md"), "w") as f:
+            with open(os.path.join(output_dir, f"{safe_name}_industry.md"), "w", encoding="utf-8") as f:
                 f.write(md)
+            with open(os.path.join(output_dir, f"{safe_name}_industry.html"), "w", encoding="utf-8") as f:
+                f.write(html_doc)
 
         except YFinanceError as e:
             st.error(f"❌ Data Error: {e}")
         except Exception as e:
             st.error(f"❌ Unexpected error: {e}")
             st.exception(e)
-
 
 # Footer
 st.divider()
