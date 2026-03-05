@@ -3,6 +3,9 @@ from __future__ import annotations
 import logging
 import yfinance as yf
 import pandas as pd
+import streamlit as st
+import time
+import random
 from data.schemas import (
     CompanyProfile, FinancialStatement, FinancialHistory, UniverseCompany,
 )
@@ -12,7 +15,52 @@ logger = logging.getLogger(__name__)
 
 class YFinanceError(Exception):
     pass
+# ---- Rate-limit protection: cache + retry + jitter ----
 
+def _sleep_backoff(attempt: int):
+    # 0.8s, 1.6s, 3.2s, 6.4s + jitter
+    time.sleep((2 ** attempt) * 0.8 + random.uniform(0, 0.4))
+
+@st.cache_data(ttl=60*60*24, show_spinner=False)  # cache 24h per ticker
+def _cached_info(ticker: str) -> dict:
+    t = yf.Ticker(ticker)
+    return t.info or {}
+
+@st.cache_data(ttl=60*60*24, show_spinner=False)  # cache 24h per ticker
+def _cached_history_last_close(ticker: str) -> float:
+    t = yf.Ticker(ticker)
+    hist = t.history(period="5d")
+    if hist is None or hist.empty:
+        return 0.0
+    return float(hist["Close"].iloc[-1])
+
+@st.cache_data(ttl=60*60*24, show_spinner=False)  # cache 24h per ticker
+def _cached_financial_frames(ticker: str):
+    t = yf.Ticker(ticker)
+    return t.financials, t.balance_sheet, t.cashflow
+
+def _get_info_with_retry(ticker: str, max_retries: int = 4) -> dict:
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            info = _cached_info(ticker)
+            if info:
+                return info
+            return {}
+        except Exception as e:
+            last_err = e
+            _sleep_backoff(attempt)
+    raise YFinanceError(f"Failed to fetch info for {ticker}: {last_err}")
+
+def _get_financials_with_retry(ticker: str, max_retries: int = 4):
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            return _cached_financial_frames(ticker)
+        except Exception as e:
+            last_err = e
+            _sleep_backoff(attempt)
+    raise YFinanceError(f"Failed to fetch financials for {ticker}: {last_err}")
 
 class YFinanceClient:
     """Full data client using yfinance — free, no API key needed."""
@@ -23,11 +71,10 @@ class YFinanceClient:
     def get_profile(self, ticker: str) -> CompanyProfile:
         """Fetch company profile via yfinance."""
         ticker = ticker.upper()
-        t = yf.Ticker(ticker)
-        try:
-            info = t.info
-        except Exception as e:
-            raise YFinanceError(f"Failed to fetch info for {ticker}: {e}")
+    try:
+        info = _get_info_with_retry(ticker)
+    except Exception as e:
+        raise YFinanceError(f"Failed to fetch info for {ticker}: {e}")
 
         if not info or info.get("quoteType") is None:
             raise YFinanceError(f"No data found for ticker {ticker}")
@@ -46,12 +93,11 @@ class YFinanceClient:
     def get_financial_history(self, ticker: str) -> FinancialHistory:
         """Fetch complete financial history for a ticker using yfinance."""
         ticker = ticker.upper()
-        t = yf.Ticker(ticker)
 
-        try:
-            info = t.info
-        except Exception as e:
-            raise YFinanceError(f"Failed to fetch info for {ticker}: {e}")
+    try:
+        info = _get_info_with_retry(ticker)
+    except Exception as e:
+        raise YFinanceError(f"Failed to fetch info for {ticker}: {e}")
 
         if not info or info.get("quoteType") is None:
             raise YFinanceError(f"No data found for ticker {ticker}")
@@ -69,15 +115,11 @@ class YFinanceClient:
         )
 
         # Fetch financial statements
-        try:
-            income_annual = t.financials  # columns = dates, rows = line items
-            balance_annual = t.balance_sheet
-            cashflow_annual = t.cashflow
-        except Exception as e:
-            raise YFinanceError(f"Failed to fetch financials for {ticker}: {e}")
-
-        if income_annual is None or income_annual.empty:
-            raise YFinanceError(f"No financial statements found for {ticker}")
+      
+    try:
+        income_annual, balance_annual, cashflow_annual = _get_financials_with_retry(ticker)
+    except Exception as e:
+        raise YFinanceError(f"Failed to fetch financials for {ticker}: {e}")
 
         statements = []
 
@@ -191,11 +233,8 @@ class YFinanceClient:
         shares_out = info.get("sharesOutstanding") or info.get("impliedSharesOutstanding") or 0
 
         if current_price == 0:
-            # Try fast_info or history as fallback
             try:
-                hist = t.history(period="5d")
-                if not hist.empty:
-                    current_price = float(hist['Close'].iloc[-1])
+                current_price = _cached_history_last_close(ticker)
             except Exception:
                 pass
 
@@ -325,8 +364,7 @@ class YFinanceClient:
             if not sym or "." in sym:  # Skip non-US tickers
                 continue
             try:
-                t = yf.Ticker(sym)
-                info = t.info
+                info = _get_info_with_retry(sym)
                 mcap = info.get("marketCap") or 0
                 if mcap < min_market_cap:
                     continue
