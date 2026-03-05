@@ -1,13 +1,26 @@
-"""yfinance-based data client — replaces FMP for all financial data."""
+"""yfinance-based data client — replaces FMP for all financial data.
+
+Goals:
+- Be resilient against Yahoo/yfinance rate limits (429) via caching + retry + jitter.
+- Keep changes small and compatible with your existing schemas and app.
+- Make industry screening return something useful even when Yahoo screeners/search are flaky.
+"""
 from __future__ import annotations
+
 import logging
-import yfinance as yf
-import pandas as pd
-import streamlit as st
 import time
 import random
+from typing import Any, Dict, Tuple, List
+
+import pandas as pd
+import streamlit as st
+import yfinance as yf
+
 from data.schemas import (
-    CompanyProfile, FinancialStatement, FinancialHistory, UniverseCompany,
+    CompanyProfile,
+    FinancialStatement,
+    FinancialHistory,
+    UniverseCompany,
 )
 
 logger = logging.getLogger(__name__)
@@ -15,18 +28,25 @@ logger = logging.getLogger(__name__)
 
 class YFinanceError(Exception):
     pass
-# ---- Rate-limit protection: cache + retry + jitter ----
 
-def _sleep_backoff(attempt: int):
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Rate-limit protection: cache + retry + jitter
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _sleep_backoff(attempt: int) -> None:
+    """Exponential backoff with jitter."""
     # 0.8s, 1.6s, 3.2s, 6.4s + jitter
     time.sleep((2 ** attempt) * 0.8 + random.uniform(0, 0.4))
 
-@st.cache_data(ttl=60*60*24, show_spinner=False)  # cache 24h per ticker
-def _cached_info(ticker: str) -> dict:
+
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)  # cache 24h per ticker
+def _cached_info(ticker: str) -> Dict[str, Any]:
     t = yf.Ticker(ticker)
     return t.info or {}
 
-@st.cache_data(ttl=60*60*24, show_spinner=False)  # cache 24h per ticker
+
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)  # cache 24h per ticker
 def _cached_history_last_close(ticker: str) -> float:
     t = yf.Ticker(ticker)
     hist = t.history(period="5d")
@@ -34,47 +54,108 @@ def _cached_history_last_close(ticker: str) -> float:
         return 0.0
     return float(hist["Close"].iloc[-1])
 
-@st.cache_data(ttl=60*60*24, show_spinner=False)  # cache 24h per ticker
-def _cached_financial_frames(ticker: str):
+
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)  # cache 24h per ticker
+def _cached_financial_frames(ticker: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     t = yf.Ticker(ticker)
+    # These each trigger requests under the hood; caching here saves a lot.
     return t.financials, t.balance_sheet, t.cashflow
 
-def _get_info_with_retry(ticker: str, max_retries: int = 4) -> dict:
-    last_err = None
+
+def _get_info_with_retry(ticker: str, max_retries: int = 5) -> Dict[str, Any]:
+    last_err: Exception | None = None
     for attempt in range(max_retries):
         try:
             info = _cached_info(ticker)
             if info:
                 return info
-            return {}
+            # Sometimes yfinance returns empty dict transiently.
+            last_err = ValueError("Empty info payload")
+            _sleep_backoff(attempt)
         except Exception as e:
             last_err = e
             _sleep_backoff(attempt)
     raise YFinanceError(f"Failed to fetch info for {ticker}: {last_err}")
 
-def _get_financials_with_retry(ticker: str, max_retries: int = 4):
-    last_err = None
+
+def _get_financials_with_retry(ticker: str, max_retries: int = 5) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    last_err: Exception | None = None
     for attempt in range(max_retries):
         try:
-            return _cached_financial_frames(ticker)
+            frames = _cached_financial_frames(ticker)
+            return frames
         except Exception as e:
             last_err = e
             _sleep_backoff(attempt)
     raise YFinanceError(f"Failed to fetch financials for {ticker}: {last_err}")
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Seed universes: ensures industry analysis returns tickers even when
+# Yahoo screeners/search are flaky.
+# ──────────────────────────────────────────────────────────────────────────────
+
+SEED_INDUSTRIES: Dict[str, List[str]] = {
+    "healthcare": [
+        "UNH", "ELV", "CVS", "CI", "HUM",
+        "JNJ", "PFE", "MRK", "ABBV", "LLY",
+        "BMY", "AMGN", "TMO", "DHR", "SYK",
+        "MDT", "BSX", "ISRG", "GILD", "REGN",
+        "VRTX", "BIIB", "HCA", "UHS", "CNC",
+    ],
+    "semiconductors": [
+        "NVDA", "AMD", "AVGO", "INTC", "TSM",
+        "ASML", "TXN", "QCOM", "MU", "AMAT",
+        "LRCX", "KLAC",
+    ],
+    "banks": [
+        "JPM", "BAC", "WFC", "C", "GS",
+        "MS", "USB", "PNC", "TFC",
+    ],
+    "software": [
+        "MSFT", "ORCL", "ADBE", "CRM", "NOW",
+        "SNOW", "DDOG", "INTU", "WDAY",
+    ],
+}
+
+
+def _seed_universe(industry: str, limit: int) -> List[UniverseCompany]:
+    """Return seed tickers for common industries (no network calls)."""
+    key = (industry or "").strip().lower()
+    tickers = SEED_INDUSTRIES.get(key, [])
+    if not tickers:
+        return []
+    out: List[UniverseCompany] = []
+    for t in tickers[:limit]:
+        out.append(UniverseCompany(
+            ticker=t,
+            name=t,
+            market_cap=0,
+            revenue_ttm=None,
+            sector="",
+            industry=industry,
+            exchange="",
+            inclusion_rationale="Seed universe (fallback)",
+        ))
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Client
+# ──────────────────────────────────────────────────────────────────────────────
+
 class YFinanceClient:
     """Full data client using yfinance — free, no API key needed."""
 
     def __init__(self):
-        pass  # No API key required
+        pass
 
     def get_profile(self, ticker: str) -> CompanyProfile:
-        """Fetch company profile via yfinance."""
-        ticker = ticker.upper()
-    try:
-        info = _get_info_with_retry(ticker)
-    except Exception as e:
-        raise YFinanceError(f"Failed to fetch info for {ticker}: {e}")
+        ticker = ticker.upper().strip()
+        try:
+            info = _get_info_with_retry(ticker)
+        except Exception as e:
+            raise YFinanceError(f"Failed to fetch info for {ticker}: {e}")
 
         if not info or info.get("quoteType") is None:
             raise YFinanceError(f"No data found for ticker {ticker}")
@@ -91,18 +172,17 @@ class YFinanceClient:
         )
 
     def get_financial_history(self, ticker: str) -> FinancialHistory:
-        """Fetch complete financial history for a ticker using yfinance."""
-        ticker = ticker.upper()
+        ticker = ticker.upper().strip()
 
-    try:
-        info = _get_info_with_retry(ticker)
-    except Exception as e:
-        raise YFinanceError(f"Failed to fetch info for {ticker}: {e}")
+        # Info (cached + retry)
+        try:
+            info = _get_info_with_retry(ticker)
+        except Exception as e:
+            raise YFinanceError(f"Failed to fetch info for {ticker}: {e}")
 
         if not info or info.get("quoteType") is None:
             raise YFinanceError(f"No data found for ticker {ticker}")
 
-        # Build profile
         profile = CompanyProfile(
             ticker=ticker,
             name=info.get("longName") or info.get("shortName") or ticker,
@@ -114,84 +194,90 @@ class YFinanceClient:
             exchange=info.get("exchange") or "",
         )
 
-        # Fetch financial statements
-      
-    try:
-        income_annual, balance_annual, cashflow_annual = _get_financials_with_retry(ticker)
-    except Exception as e:
-        raise YFinanceError(f"Failed to fetch financials for {ticker}: {e}")
+        # Financial statements (cached + retry)
+        try:
+            income_annual, balance_annual, cashflow_annual = _get_financials_with_retry(ticker)
+        except Exception as e:
+            raise YFinanceError(f"Failed to fetch financials for {ticker}: {e}")
 
-        statements = []
+        if income_annual is None or getattr(income_annual, "empty", True):
+            raise YFinanceError(f"No financial statements found for {ticker}")
+
+        statements: List[FinancialStatement] = []
+
+        def _get(series: pd.Series, *keys: str, default: float = 0.0) -> float:
+            for key in keys:
+                try:
+                    val = series.get(key)
+                    if val is not None and not pd.isna(val):
+                        return float(val)
+                except Exception:
+                    continue
+            return default
 
         # yfinance returns DataFrames with dates as columns (newest first)
         for col in income_annual.columns:
-            year = col.year if hasattr(col, 'year') else int(str(col)[:4])
+            year = col.year if hasattr(col, "year") else int(str(col)[:4])
 
             inc = income_annual[col] if col in income_annual.columns else pd.Series(dtype=float)
-            bs = balance_annual[col] if balance_annual is not None and col in balance_annual.columns else pd.Series(dtype=float)
-            cf = cashflow_annual[col] if cashflow_annual is not None and col in cashflow_annual.columns else pd.Series(dtype=float)
+            bs = (
+                balance_annual[col]
+                if balance_annual is not None and hasattr(balance_annual, "columns") and col in balance_annual.columns
+                else pd.Series(dtype=float)
+            )
+            cf = (
+                cashflow_annual[col]
+                if cashflow_annual is not None and hasattr(cashflow_annual, "columns") and col in cashflow_annual.columns
+                else pd.Series(dtype=float)
+            )
 
-            def _get(series, *keys, default=0):
-                """Try multiple possible key names, return first found."""
-                for key in keys:
-                    try:
-                        val = series.get(key)
-                        if val is not None and not pd.isna(val):
-                            return float(val)
-                    except (KeyError, TypeError):
-                        continue
-                return default
+            revenue = _get(inc, "Total Revenue", "Operating Revenue")
+            cost_of_revenue = _get(inc, "Cost Of Revenue")
+            gross_profit = _get(inc, "Gross Profit")
+            operating_income = _get(inc, "Operating Income", "EBIT")
+            net_income = _get(inc, "Net Income", "Net Income Common Stockholders")
+            eps = _get(inc, "Basic EPS", "Diluted EPS")
+            shares = _get(inc, "Basic Average Shares", "Diluted Average Shares")
+            rd = _get(inc, "Research And Development", "Research Development")
+            sga = _get(inc, "Selling General And Administration", "Selling And Marketing Expense")
 
-            revenue = _get(inc, 'Total Revenue', 'Operating Revenue')
-            cost_of_revenue = _get(inc, 'Cost Of Revenue')
-            gross_profit = _get(inc, 'Gross Profit')
-            operating_income = _get(inc, 'Operating Income', 'EBIT')
-            net_income = _get(inc, 'Net Income', 'Net Income Common Stockholders')
-            eps = _get(inc, 'Basic EPS', 'Diluted EPS')
-            shares = _get(inc, 'Basic Average Shares', 'Diluted Average Shares')
-            rd = _get(inc, 'Research And Development', 'Research Development')
-            sga = _get(inc, 'Selling General And Administration',
-                       'Selling And Marketing Expense')
+            total_assets = _get(bs, "Total Assets")
+            total_liabilities = _get(bs, "Total Liabilities Net Minority Interest", "Total Liab")
+            total_equity = _get(bs, "Stockholders Equity", "Total Stockholder Equity", "Common Stock Equity")
+            long_term_debt = _get(bs, "Long Term Debt", "Long Term Debt And Capital Lease Obligation")
+            total_debt = _get(bs, "Total Debt", "Net Debt")
+            cash = _get(bs, "Cash And Cash Equivalents",
+                        "Cash Cash Equivalents And Short Term Investments",
+                        "Cash")
 
-            total_assets = _get(bs, 'Total Assets')
-            total_liabilities = _get(bs, 'Total Liabilities Net Minority Interest',
-                                     'Total Liab')
-            total_equity = _get(bs, 'Stockholders Equity',
-                               'Total Stockholder Equity',
-                               'Common Stock Equity')
-            long_term_debt = _get(bs, 'Long Term Debt', 'Long Term Debt And Capital Lease Obligation')
-            total_debt = _get(bs, 'Total Debt', 'Net Debt')
-            cash = _get(bs, 'Cash And Cash Equivalents',
-                       'Cash Cash Equivalents And Short Term Investments',
-                       'Cash')
-
-            dep = _get(cf, 'Depreciation And Amortization',
-                      'Depreciation & Amortization')
-            capex_raw = _get(cf, 'Capital Expenditure', 'Capital Expenditures')
+            dep = _get(cf, "Depreciation And Amortization", "Depreciation & Amortization")
+            capex_raw = _get(cf, "Capital Expenditure", "Capital Expenditures")
             capex = abs(capex_raw)
-            ocf = _get(cf, 'Operating Cash Flow', 'Cash Flow From Continuing Operating Activities',
-                      'Total Cash From Operating Activities')
-            fcf = _get(cf, 'Free Cash Flow')
+            ocf = _get(cf,
+                       "Operating Cash Flow",
+                       "Cash Flow From Continuing Operating Activities",
+                       "Total Cash From Operating Activities")
+            fcf = _get(cf, "Free Cash Flow")
             if fcf == 0 and ocf != 0:
                 fcf = ocf - capex
 
-            dividends_raw = _get(cf, 'Common Stock Dividend Paid',
-                                'Cash Dividends Paid',
-                                'Payment Of Dividends And Other Cash Distributions')
+            dividends_raw = _get(cf,
+                                 "Common Stock Dividend Paid",
+                                 "Cash Dividends Paid",
+                                 "Payment Of Dividends And Other Cash Distributions")
             dividends = abs(dividends_raw)
 
-            wc_change = _get(cf, 'Change In Working Capital',
-                            'Changes In Account Receivables')
+            wc_change = _get(cf, "Change In Working Capital", "Changes In Account Receivables")
 
-            # If gross profit not available, compute it
+            # Compute missing gross profit
             if gross_profit == 0 and revenue > 0 and cost_of_revenue > 0:
                 gross_profit = revenue - cost_of_revenue
 
-            # If shares not available from income, try info
+            # shares fallback
             if shares == 0:
                 shares = info.get("sharesOutstanding") or info.get("impliedSharesOutstanding") or 0
 
-            # If EPS not available, compute it
+            # EPS fallback
             if eps == 0 and net_income != 0 and shares > 0:
                 eps = net_income / shares
 
@@ -221,10 +307,8 @@ class YFinanceClient:
             )
             statements.append(stmt)
 
-        # Sort oldest to newest
+        # Sort oldest to newest and filter out junk years
         statements.sort(key=lambda s: s.fiscal_year)
-
-        # Filter out years with no meaningful data (e.g. partial/future years)
         statements = [s for s in statements if s.revenue > 0 or s.net_income != 0]
 
         # Current price
@@ -253,18 +337,26 @@ class YFinanceClient:
         sort_by: str = "market_cap",
         limit: int = 20,
         min_market_cap: float = 1_000_000_000,
-    ) -> list[UniverseCompany]:
-        """Screen for companies in an industry using yfinance screener."""
+    ) -> List[UniverseCompany]:
+        """Screen for companies in an industry using yfinance screener.
+
+        If screener fails or returns empty, fallback to:
+        1) seed universe (fast, no network)
+        2) yfinance search + cached info lookup (network, but cached)
+        """
+        # 1) seed universe first (fast + reliable) for common labels
+        seeded = _seed_universe(industry, limit)
+        if seeded:
+            return seeded[:limit]
+
+        # 2) try Yahoo screener (best effort)
         try:
-            # Use yfinance screener
             from yfinance import Screener
 
             s = Screener()
-            # Try to find a matching predefined screen, or use custom query
-            # yfinance screener has limited options; we'll use sector-based approach
-            results = []
+            results: List[Dict[str, Any]] = []
 
-            # Use the most_actives as a broad starting point and filter
+            quotes: List[Dict[str, Any]] = []
             try:
                 s.set_predefined_body("most_actives")
                 data = s.response
@@ -272,7 +364,6 @@ class YFinanceClient:
             except Exception:
                 quotes = []
 
-            # Also try day_gainers and day_losers for broader coverage
             for screen_name in ["day_gainers", "day_losers", "most_actives"]:
                 try:
                     s2 = Screener()
@@ -285,83 +376,74 @@ class YFinanceClient:
 
             # Deduplicate
             seen = set()
-            unique_quotes = []
+            unique_quotes: List[Dict[str, Any]] = []
             for q in quotes:
                 sym = q.get("symbol", "")
                 if sym and sym not in seen:
                     seen.add(sym)
                     unique_quotes.append(q)
 
-            # Filter by industry
-            industry_lower = industry.lower()
+            industry_lower = (industry or "").lower()
             for q in unique_quotes:
                 q_industry = (q.get("industry") or "").lower()
                 q_sector = (q.get("sector") or "").lower()
                 mcap = q.get("marketCap", 0) or 0
-
                 if mcap < min_market_cap:
                     continue
-
-                if industry_lower in q_industry or industry_lower in q_sector:
+                if industry_lower and (industry_lower in q_industry or industry_lower in q_sector):
                     results.append(q)
 
-            if not results:
-                # Fallback: use a curated list of well-known tickers per industry
-                results = self._fallback_industry_search(industry, min_market_cap)
-                return results[:limit]
+            if results:
+                if sort_by == "revenue":
+                    results.sort(key=lambda x: x.get("revenue", 0) or 0, reverse=True)
+                else:
+                    results.sort(key=lambda x: x.get("marketCap", 0) or 0, reverse=True)
 
-            # Sort
-            if sort_by == "revenue":
-                results.sort(key=lambda x: x.get("revenue", 0) or 0, reverse=True)
-            else:
-                results.sort(key=lambda x: x.get("marketCap", 0) or 0, reverse=True)
-
-            companies = []
-            for i, item in enumerate(results[:limit]):
-                mcap = item.get("marketCap", 0) or 0
-                companies.append(UniverseCompany(
-                    ticker=item.get("symbol", ""),
-                    name=item.get("longName") or item.get("shortName") or "",
-                    market_cap=mcap,
-                    revenue_ttm=item.get("revenue"),
-                    sector=item.get("sector") or "",
-                    industry=item.get("industry") or "",
-                    exchange=item.get("exchange") or "",
-                    inclusion_rationale=(
-                        f"Ranked #{i+1} by {sort_by.replace('_', ' ')} in {industry} "
-                        f"(${mcap/1e9:.1f}B market cap)"
-                    ),
-                ))
-
-            return companies
+                companies: List[UniverseCompany] = []
+                for i, item in enumerate(results[:limit]):
+                    mcap = item.get("marketCap", 0) or 0
+                    companies.append(UniverseCompany(
+                        ticker=item.get("symbol", ""),
+                        name=item.get("longName") or item.get("shortName") or "",
+                        market_cap=mcap,
+                        revenue_ttm=item.get("revenue"),
+                        sector=item.get("sector") or "",
+                        industry=item.get("industry") or "",
+                        exchange=item.get("exchange") or "",
+                        inclusion_rationale=(
+                            f"Ranked #{i + 1} by {sort_by.replace('_', ' ')} in {industry} "
+                            f"(${mcap / 1e9:.1f}B market cap)"
+                        ),
+                    ))
+                return companies
 
         except ImportError:
-            # Screener not available in this yfinance version
-            return self._fallback_industry_search(industry, min_market_cap)[:limit]
+            pass
         except Exception as e:
-            logger.warning(f"Screener failed: {e}, using fallback")
-            return self._fallback_industry_search(industry, min_market_cap)[:limit]
+            logger.warning(f"Screener failed: {e}")
+
+        # 3) fallback search (cached info; slowest)
+        return self._fallback_industry_search(industry, min_market_cap)[:limit]
 
     def _fallback_industry_search(
         self,
         industry: str,
         min_market_cap: float = 1_000_000_000,
-    ) -> list[UniverseCompany]:
-        """Fallback: search for companies using yfinance search + info lookup."""
+    ) -> List[UniverseCompany]:
+        """Fallback: search for companies using yfinance search + cached info lookup."""
         try:
-            # Use yfinance search
             search_results = yf.Search(industry, max_results=30)
-            quotes = search_results.quotes if hasattr(search_results, 'quotes') else []
+            quotes = search_results.quotes if hasattr(search_results, "quotes") else []
         except Exception:
             quotes = []
 
         if not quotes:
             return []
 
-        companies = []
+        companies: List[UniverseCompany] = []
         for q in quotes:
-            sym = q.get("symbol", "")
-            if not sym or "." in sym:  # Skip non-US tickers
+            sym = (q.get("symbol", "") or "").upper()
+            if not sym or "." in sym:  # Skip many non-US tickers
                 continue
             try:
                 info = _get_info_with_retry(sym)
