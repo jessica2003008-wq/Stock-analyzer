@@ -21,6 +21,11 @@ from reports.industry_report_gen import run_industry_analysis, industry_report_t
 
 anthropic_key = st.secrets.get("ANTHROPIC_API_KEY", "")
 
+# Clear stale caches on new deployment
+if "cache_version" not in st.session_state or st.session_state.cache_version != "v2.1.1":
+    st.cache_data.clear()
+    st.session_state.cache_version = "v2.1.1"
+
 
 def md_to_styled_html(md_text: str, title: str = "Buffett Analyzer Report") -> str:
     """Convert Markdown to a standalone, styled HTML document (pretty in browser)."""
@@ -86,7 +91,8 @@ st.set_page_config(
 )
 
 st.title("🔬 Buffett Analyzer")
-st.caption("v2.1 — Multi-source data with currency conversion | Not financial advice")
+st.caption("v2.1.1 — Currency conversion + validation | Not financial advice")
+st.info("ℹ️ Version 2.1.1 — If you see old results, click the ⋮ menu → Clear cache, then rerun.")
 
 # ── Sidebar: Configuration ──
 with st.sidebar:

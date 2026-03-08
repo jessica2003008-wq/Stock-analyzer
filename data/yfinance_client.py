@@ -172,8 +172,8 @@ def _sleep_backoff(attempt: int) -> None:
 # Cached network calls (24h)
 # ──────────────────────────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
-def _cached_fast_info(ticker: str) -> Dict[str, Any]:
+@st.cache_data(ttl=60 * 60 * 4, show_spinner=False)
+def _cached_fast_info(ticker: str, _v: str = "v2") -> Dict[str, Any]:
     """
     fast_info is usually lighter than info. It may miss sector/industry/description.
     """
@@ -188,8 +188,8 @@ def _cached_fast_info(ticker: str) -> Dict[str, Any]:
     return {}
 
 
-@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
-def _cached_info_full(ticker: str) -> Dict[str, Any]:
+@st.cache_data(ttl=60 * 60 * 4, show_spinner=False)
+def _cached_info_full(ticker: str, _v: str = "v2") -> Dict[str, Any]:
     """
     Full info is heavy and most likely to hit rate limits.
     Keep it cached aggressively.
@@ -201,8 +201,8 @@ def _cached_info_full(ticker: str) -> Dict[str, Any]:
     return t.info or {}
 
 
-@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
-def _cached_history_last_close(ticker: str) -> float:
+@st.cache_data(ttl=60 * 60 * 4, show_spinner=False)
+def _cached_history_last_close(ticker: str, _v: str = "v2") -> float:
     t = yf.Ticker(ticker)
     hist = t.history(period="5d", auto_adjust=False)
     if hist is None or hist.empty:
@@ -210,8 +210,8 @@ def _cached_history_last_close(ticker: str) -> float:
     return float(hist["Close"].iloc[-1])
 
 
-@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
-def _cached_financial_frames(ticker: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+@st.cache_data(ttl=60 * 60 * 4, show_spinner=False)
+def _cached_financial_frames(ticker: str, _v: str = "v2") -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     These are expensive. Cache saves a lot when you analyze many tickers/day.
     """
