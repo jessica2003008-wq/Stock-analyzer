@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Tuple
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+import requests
 
 from data.schemas import CompanyProfile, FinancialStatement, FinancialHistory, UniverseCompany
 
@@ -31,6 +32,116 @@ logger = logging.getLogger(__name__)
 
 class YFinanceError(Exception):
     pass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Currency conversion for US-listed foreign reporters
+# ──────────────────────────────────────────────────────────────────────────────
+
+FOREIGN_CURRENCY_REPORTERS: Dict[str, Tuple[str, float]] = {
+    # Chinese companies on NASDAQ/NYSE reporting in RMB
+    "PDD": ("CNY", 7.25), "BABA": ("CNY", 7.25), "JD": ("CNY", 7.25),
+    "NIO": ("CNY", 7.25), "LI": ("CNY", 7.25), "XPEV": ("CNY", 7.25),
+    "BIDU": ("CNY", 7.25), "BILI": ("CNY", 7.25), "IQ": ("CNY", 7.25),
+    "TME": ("CNY", 7.25), "ZTO": ("CNY", 7.25), "VNET": ("CNY", 7.25),
+    "WB": ("CNY", 7.25), "MNSO": ("CNY", 7.25), "QFIN": ("CNY", 7.25),
+    "FINV": ("CNY", 7.25), "LU": ("CNY", 7.25), "TCOM": ("CNY", 7.25),
+    "FUTU": ("HKD", 7.80), "YMM": ("CNY", 7.25), "KC": ("CNY", 7.25),
+    # Japanese
+    "SONY": ("JPY", 150.0), "TM": ("JPY", 150.0), "HMC": ("JPY", 150.0),
+    "MUFG": ("JPY", 150.0), "SMFG": ("JPY", 150.0),
+    # European
+    "SAP": ("EUR", 0.92), "ASML": ("EUR", 0.92), "NVO": ("DKK", 6.90),
+    "AZN": ("GBP", 0.79), "GSK": ("GBP", 0.79), "BP": ("GBP", 0.79),
+    "SHEL": ("GBP", 0.79), "UL": ("GBP", 0.79), "DEO": ("GBP", 0.79),
+    # Other
+    "NU": ("BRL", 5.0), "STNE": ("BRL", 5.0),
+}
+
+_EXCHANGE_RATES: Dict[str, float] = {}
+
+def _get_live_rate(currency: str) -> float | None:
+    if currency == "USD":
+        return 1.0
+    if currency in _EXCHANGE_RATES:
+        return _EXCHANGE_RATES[currency]
+    try:
+        resp = requests.get("https://api.exchangerate-api.com/v4/latest/USD", timeout=5)
+        if resp.status_code == 200:
+            rates = resp.json().get("rates", {})
+            _EXCHANGE_RATES.update(rates)
+            return rates.get(currency)
+    except Exception:
+        pass
+    return None
+
+
+def _convert_statements_to_usd(
+    statements: List[FinancialStatement], rate: float
+) -> List[FinancialStatement]:
+    """Divide all monetary fields by exchange rate to convert to USD."""
+    converted = []
+    for s in statements:
+        converted.append(FinancialStatement(
+            fiscal_year=s.fiscal_year,
+            revenue=s.revenue / rate,
+            cost_of_revenue=s.cost_of_revenue / rate,
+            gross_profit=s.gross_profit / rate,
+            operating_income=s.operating_income / rate,
+            net_income=s.net_income / rate,
+            eps=s.eps / rate if s.eps else 0,
+            shares_outstanding=s.shares_outstanding,
+            total_assets=s.total_assets / rate,
+            total_liabilities=s.total_liabilities / rate,
+            total_equity=s.total_equity / rate,
+            long_term_debt=s.long_term_debt / rate,
+            total_debt=s.total_debt / rate,
+            cash_and_equivalents=s.cash_and_equivalents / rate,
+            depreciation_amortization=s.depreciation_amortization / rate,
+            capital_expenditure=s.capital_expenditure / rate,
+            operating_cash_flow=s.operating_cash_flow / rate,
+            free_cash_flow=s.free_cash_flow / rate,
+            dividends_paid=s.dividends_paid / rate,
+            change_in_working_capital=s.change_in_working_capital / rate,
+            research_and_development=(s.research_and_development / rate) if s.research_and_development else None,
+            sga_expense=(s.sga_expense / rate) if s.sga_expense else None,
+        ))
+    return converted
+
+
+def _detect_and_convert_currency(
+    ticker: str,
+    statements: List[FinancialStatement],
+    price_usd: float,
+    shares: float,
+) -> Tuple[List[FinancialStatement], str]:
+    """Detect currency mismatch and convert to USD if needed."""
+    if not statements or price_usd <= 0 or shares <= 0:
+        return statements, ""
+
+    ticker_upper = ticker.upper()
+
+    # Method 1: Known foreign reporters
+    if ticker_upper in FOREIGN_CURRENCY_REPORTERS:
+        currency, fallback_rate = FOREIGN_CURRENCY_REPORTERS[ticker_upper]
+        live_rate = _get_live_rate(currency)
+        rate = live_rate if live_rate else fallback_rate
+        logger.info(f"{ticker}: converting from {currency} to USD (rate: {rate:.2f})")
+        return _convert_statements_to_usd(statements, rate), \
+            f"Financials converted from {currency} to USD (1 USD = {rate:.2f} {currency})"
+
+    # Method 2: Heuristic — revenue/share >> price suggests foreign currency
+    latest = statements[-1]
+    if latest.revenue > 0 and shares > 0:
+        rev_per_share = latest.revenue / shares
+        ratio = rev_per_share / price_usd
+        if ratio > 3:
+            estimated_rate = ratio
+            logger.warning(f"{ticker}: auto-detected currency mismatch (ratio {ratio:.1f}x), converting")
+            return _convert_statements_to_usd(statements, estimated_rate), \
+                f"⚠️ Auto-detected currency mismatch (ratio {ratio:.1f}x). Financials divided by {estimated_rate:.2f}."
+
+    return statements, ""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -164,18 +275,120 @@ SEED_INDUSTRIES: Dict[str, List[str]] = {
         "BMY", "AMGN", "TMO", "DHR", "SYK",
         "MDT", "BSX", "ISRG", "GILD", "REGN",
     ],
+    "pharma": [
+        "JNJ", "PFE", "MRK", "ABBV", "LLY",
+        "BMY", "AMGN", "GILD", "REGN", "VRTX",
+        "AZN", "NVO", "GSK", "SNY", "ZTS",
+    ],
+    "biotechnology": [
+        "AMGN", "GILD", "REGN", "VRTX", "MRNA",
+        "BIIB", "ILMN", "SGEN", "ALNY", "BMRN",
+    ],
     "semiconductors": [
         "NVDA", "AMD", "AVGO", "INTC", "TSM",
         "ASML", "TXN", "QCOM", "MU", "AMAT",
-        "LRCX", "KLAC",
+        "LRCX", "KLAC", "MRVL", "ON", "ADI",
     ],
     "banks": [
         "JPM", "BAC", "WFC", "C", "GS",
-        "MS", "USB", "PNC", "TFC",
+        "MS", "USB", "PNC", "TFC", "SCHW",
+    ],
+    "banking": [
+        "JPM", "BAC", "WFC", "C", "GS",
+        "MS", "USB", "PNC", "TFC", "SCHW",
+    ],
+    "financial services": [
+        "JPM", "BAC", "GS", "MS", "BLK",
+        "SCHW", "AXP", "V", "MA", "COF",
+    ],
+    "insurance": [
+        "BRK-B", "PGR", "ALL", "MET", "AIG",
+        "PRU", "TRV", "AFL", "HIG", "CINF",
     ],
     "software": [
         "MSFT", "ORCL", "ADBE", "CRM", "NOW",
-        "SNOW", "DDOG", "INTU", "WDAY",
+        "SNOW", "DDOG", "INTU", "WDAY", "PANW",
+    ],
+    "cloud computing": [
+        "AMZN", "MSFT", "GOOG", "CRM", "NOW",
+        "SNOW", "DDOG", "NET", "MDB", "DKNG",
+    ],
+    "internet": [
+        "GOOG", "META", "AMZN", "NFLX", "SNAP",
+        "PINS", "SPOT", "ROKU", "TTD", "UBER",
+    ],
+    "e-commerce": [
+        "AMZN", "PDD", "JD", "BABA", "MELI",
+        "SHOP", "ETSY", "EBAY", "W", "CPNG",
+    ],
+    "consumer electronics": [
+        "AAPL", "SONY", "DELL", "HPQ", "LOGI",
+        "SONO", "GPRO", "KOSS", "HEAR", "CRSR",
+    ],
+    "consumer staples": [
+        "PG", "KO", "PEP", "COST", "WMT",
+        "CL", "MO", "PM", "KMB", "GIS",
+        "K", "HSY", "SJM", "CPB", "CAG",
+    ],
+    "retail": [
+        "WMT", "COST", "HD", "LOW", "TGT",
+        "TJX", "ROST", "DG", "DLTR", "BBY",
+    ],
+    "restaurants": [
+        "MCD", "SBUX", "CMG", "YUM", "DPZ",
+        "QSR", "DINE", "JACK", "WEN", "PZZA",
+    ],
+    "energy": [
+        "XOM", "CVX", "COP", "SLB", "EOG",
+        "MPC", "VLO", "PSX", "OXY", "DVN",
+    ],
+    "oil & gas": [
+        "XOM", "CVX", "COP", "SLB", "EOG",
+        "MPC", "VLO", "PSX", "OXY", "DVN",
+    ],
+    "utilities": [
+        "NEE", "DUK", "SO", "D", "AEP",
+        "EXC", "SRE", "XEL", "WEC", "ED",
+    ],
+    "real estate": [
+        "AMT", "PLD", "CCI", "EQIX", "SPG",
+        "PSA", "O", "WELL", "DLR", "AVB",
+    ],
+    "reits": [
+        "AMT", "PLD", "CCI", "EQIX", "SPG",
+        "PSA", "O", "WELL", "DLR", "AVB",
+    ],
+    "aerospace & defense": [
+        "LMT", "RTX", "BA", "NOC", "GD",
+        "LHX", "TDG", "HWM", "HEI", "TXT",
+    ],
+    "automotive": [
+        "TSLA", "F", "GM", "TM", "RIVN",
+        "STLA", "HMC", "NIO", "LI", "XPEV",
+    ],
+    "electric vehicles": [
+        "TSLA", "RIVN", "NIO", "LI", "XPEV",
+        "LCID", "FSR", "PSNY", "FFIE", "GOEV",
+    ],
+    "clean energy": [
+        "ENPH", "SEDG", "FSLR", "RUN", "NEE",
+        "PLUG", "BE", "CSIQ", "JKS", "NOVA",
+    ],
+    "telecommunications": [
+        "T", "VZ", "TMUS", "CMCSA", "CHTR",
+        "AMT", "CCI", "SBAC", "LUMN", "FTR",
+    ],
+    "media & entertainment": [
+        "DIS", "NFLX", "CMCSA", "WBD", "PARA",
+        "RBLX", "TTWO", "EA", "LYV", "IMAX",
+    ],
+    "industrials": [
+        "HON", "UNP", "UPS", "CAT", "DE",
+        "GE", "MMM", "EMR", "ITW", "ROK",
+    ],
+    "materials": [
+        "LIN", "APD", "SHW", "ECL", "DD",
+        "NEM", "FCX", "NUE", "VMC", "MLM",
     ],
 }
 
@@ -407,6 +620,14 @@ class YFinanceClient:
         shares_out = 0.0
         if info:
             shares_out = float(info.get("sharesOutstanding") or info.get("impliedSharesOutstanding") or 0.0)
+
+        # ── Currency conversion ──
+        # Some companies (PDD, BABA, etc.) report financials in foreign currency but trade in USD
+        statements, currency_note = _detect_and_convert_currency(
+            ticker, statements, current_price, shares_out
+        )
+        if currency_note:
+            logger.info(f"{ticker}: {currency_note}")
 
         return FinancialHistory(
             ticker=ticker,

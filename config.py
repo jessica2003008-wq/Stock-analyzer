@@ -14,42 +14,46 @@ DISCOUNT_RATE = 0.10
 TERMINAL_GROWTH_RATE = 0.04
 MAINTENANCE_CAPEX_RATIO = 1.0  # Multiplier on D&A
 
-# Scenario parameters
+# Scenario parameters (conservative — Buffett-style)
 SCENARIOS = {
     "bull": {
-        "growth_multiplier": 0.9,
-        "growth_cap": 0.20,
+        "growth_multiplier": 0.7,
+        "growth_cap": 0.15,       # Max 15% bull growth — very few sustain this for 10yr
         "discount_rate": 0.09,
         "terminal_growth": 0.04,
         "margin_compression": 0.0,
     },
     "base": {
-        "growth_multiplier": 0.6,
-        "growth_cap": 0.12,
+        "growth_multiplier": 0.45,
+        "growth_cap": 0.10,       # Max 10% base growth
         "discount_rate": 0.10,
         "terminal_growth": 0.03,
         "margin_compression": 0.05,
     },
     "bear": {
-        "growth_multiplier": 0.3,
-        "growth_cap": 0.05,
+        "growth_multiplier": 0.20,
+        "growth_cap": 0.04,       # Max 4% bear growth
         "discount_rate": 0.12,
         "terminal_growth": 0.02,
         "margin_compression": 0.15,
     },
 }
 
+# Growth company detection
+GROWTH_COMPANY_EARN_CAGR_THRESHOLD = 0.20
+GROWTH_COMPANY_BULL_CAP_MAX = 0.18
+
 # Industry defaults
 DEFAULT_UNIVERSE_SIZE = 20
 MIN_MARKET_CAP = 1_000_000_000  # $1B floor
 UNIVERSE_SORT = "market_cap"  # or "revenue"
 
-# Hard filter thresholds
-MIN_MOAT_SCORE = 70
-MIN_FINANCIAL_SCORE = 70
-MIN_STABILITY_SCORE = 60
-MAX_PRICE_TO_IV_RATIO = 0.85  # Price must be <= 85% of base IV
-MAX_BEAR_DOWNSIDE_PCT = 25  # Flag threshold (not elimination)
+# Hard filter thresholds (relaxed defaults — UI sliders allow tightening)
+MIN_MOAT_SCORE = 50
+MIN_FINANCIAL_SCORE = 50
+MIN_STABILITY_SCORE = 40
+MAX_PRICE_TO_IV_RATIO = 1.0
+MAX_BEAR_DOWNSIDE_PCT = 35
 
 # Scoring weights
 WEIGHTS = {

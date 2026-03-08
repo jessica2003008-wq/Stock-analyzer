@@ -17,13 +17,14 @@ from analysis.stability import analyze_stability
 from analysis.valuation import analyze_valuation
 from analysis.margin_of_safety import analyze_margin_of_safety
 from analysis.recommendation import generate_recommendation
+from validation.report_validator import validate_report
 
 logger = logging.getLogger(__name__)
 
 
 def run_company_analysis(
     ticker: str,
-    data_client: YFinanceClient,
+    data_client,  # YFinanceClient or any duck-typed client
     llm: ClaudeClient | None = None,
     edgar: EdgarClient | None = None,
     discount_rate: float | None = None,
@@ -110,6 +111,24 @@ def run_company_analysis(
         warnings=warnings,
     )
 
+    # Detect display currency for China A-shares
+    import re as _re
+    if _re.match(r'^\d{6}\.(SS|SZ)$', ticker):
+        report.currency = "CNY"
+        report.currency_note = "All values in Chinese Yuan (¥ CNY)"
+
+    # ── Validation ──
+    _progress(f"[{ticker}] Validating report...")
+    validation = validate_report(report)
+    report.validation_summary = validation.summary
+    report.validation_issues = [
+        {"severity": i.severity, "category": i.category, "message": i.message}
+        for i in validation.issues
+    ]
+    if not validation.passed:
+        warnings.append(f"VALIDATION FAILED: {validation.summary}")
+        report.warnings = warnings
+
     _progress(f"[{ticker}] Analysis complete. Recommendation: {rec.action} ({rec.position_size})")
     return report
 
@@ -125,13 +144,18 @@ def report_to_markdown(report: CompanyReport) -> str:
     v = r.valuation
     m = r.margin_of_safety
     rec = r.recommendation
+    cs = "¥" if r.currency == "CNY" else "$"
 
     lines = [
-        f"# {r.name} ({r.ticker}) — Buffett Analysis Report",
+        f"# {r.name} ({r.ticker}) — Investment Analysis Report",
         f"**Date:** {r.analysis_date}",
         f"**Recommendation:** {rec.action} | **Position Size:** {rec.position_size} | **Composite Score:** {rec.composite_score:.0f}/100",
         "",
     ]
+
+    if r.currency_note:
+        lines.append(f"**Currency:** {r.currency_note}")
+        lines.append("")
 
     if r.warnings:
         lines.append("## ⚠️ Warnings")
@@ -234,12 +258,12 @@ def report_to_markdown(report: CompanyReport) -> str:
         "",
         "| Scenario | Per Share IV | Growth | Discount | Terminal Growth |",
         "|----------|-------------|--------|----------|-----------------|",
-        f"| **Bull** | ${v.bull.per_share_value:,.2f} | {v.bull.growth_rate:.1%} | {v.bull.discount_rate:.0%} | {v.bull.terminal_growth_rate:.0%} |",
-        f"| **Base** | ${v.base.per_share_value:,.2f} | {v.base.growth_rate:.1%} | {v.base.discount_rate:.0%} | {v.base.terminal_growth_rate:.0%} |",
-        f"| **Bear** | ${v.bear.per_share_value:,.2f} | {v.bear.growth_rate:.1%} | {v.bear.discount_rate:.0%} | {v.bear.terminal_growth_rate:.0%} |",
+        f"| **Bull** | {cs}{v.bull.per_share_value:,.2f} | {v.bull.growth_rate:.1%} | {v.bull.discount_rate:.0%} | {v.bull.terminal_growth_rate:.0%} |",
+        f"| **Base** | {cs}{v.base.per_share_value:,.2f} | {v.base.growth_rate:.1%} | {v.base.discount_rate:.0%} | {v.base.terminal_growth_rate:.0%} |",
+        f"| **Bear** | {cs}{v.bear.per_share_value:,.2f} | {v.bear.growth_rate:.1%} | {v.bear.discount_rate:.0%} | {v.bear.terminal_growth_rate:.0%} |",
         "",
-        f"**EPV Sanity Check:** ${v.epv_per_share:,.2f}/share",
-        f"**Current Price:** ${v.current_price:,.2f}",
+        f"**EPV Sanity Check:** {cs}{v.epv_per_share:,.2f}/share",
+        f"**Current Price:** {cs}{v.current_price:,.2f}",
         "",
         f"**Maintenance CapEx:** {v.base.maintenance_capex_method}",
         "",
@@ -254,9 +278,9 @@ def report_to_markdown(report: CompanyReport) -> str:
         for row in v.sensitivity_table:
             lines.append(
                 f"| {row['discount_rate']:.0%} | "
-                f"${row.get('tg_2%', 0):,.2f} | "
-                f"${row.get('tg_3%', 0):,.2f} | "
-                f"${row.get('tg_4%', 0):,.2f} |"
+                f"{cs}{row.get('tg_2%', 0):,.2f} | "
+                f"{cs}{row.get('tg_3%', 0):,.2f} | "
+                f"{cs}{row.get('tg_4%', 0):,.2f} |"
             )
         lines.append("")
 
@@ -269,8 +293,8 @@ def report_to_markdown(report: CompanyReport) -> str:
         "## Step 6: Margin of Safety",
         f"**Score:** {m.score}/100 | **Verdict:** {m.verdict}",
         "",
-        f"- Current Price: ${m.current_price:,.2f}",
-        f"- Base Intrinsic Value: ${m.base_intrinsic_value:,.2f}",
+        f"- Current Price: {cs}{m.current_price:,.2f}",
+        f"- Base Intrinsic Value: {cs}{m.base_intrinsic_value:,.2f}",
         f"- Margin of Safety: {m.margin_of_safety_pct:.1f}%",
         f"- Bull Upside: {m.bull_upside_pct:.1f}%",
         f"- Bear Downside: {m.bear_downside_pct:.1f}%",
@@ -301,6 +325,23 @@ def report_to_markdown(report: CompanyReport) -> str:
     ])
     for metric in rec.monitoring_metrics:
         lines.append(f"- {metric}")
+
+    # Validation
+    if r.validation_issues:
+        lines.extend(["", "---", "## ✅ Validation"])
+        lines.append(f"**{r.validation_summary}**")
+        lines.append("")
+        errors = [i for i in r.validation_issues if i.get("severity") == "error"]
+        warns = [i for i in r.validation_issues if i.get("severity") == "warning"]
+        if errors:
+            lines.append("**Errors:**")
+            for e in errors:
+                lines.append(f"- ❌ [{e.get('category','')}] {e.get('message','')}")
+        if warns:
+            lines.append("**Warnings:**")
+            for w in warns:
+                lines.append(f"- ⚠️ [{w.get('category','')}] {w.get('message','')}")
+        lines.append("")
 
     lines.extend(["", "---", f"*Report generated {r.analysis_date}*"])
 

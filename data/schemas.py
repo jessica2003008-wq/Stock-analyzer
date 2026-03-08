@@ -168,6 +168,8 @@ class CompanyReport(BaseModel):
     ticker: str
     name: str
     analysis_date: str = ""
+    currency: str = "USD"
+    currency_note: str = ""
     competence: CompetenceResult = Field(default_factory=CompetenceResult)
     moat: MoatResult = Field(default_factory=MoatResult)
     financial_quality: FinancialQualityResult = Field(default_factory=FinancialQualityResult)
@@ -176,6 +178,8 @@ class CompanyReport(BaseModel):
     margin_of_safety: MarginOfSafetyResult = Field(default_factory=MarginOfSafetyResult)
     recommendation: RecommendationResult = Field(default_factory=RecommendationResult)
     warnings: list[str] = Field(default_factory=list)
+    validation_summary: str = ""
+    validation_issues: list[dict] = Field(default_factory=list)
 
 
 # ── Industry Models ──────────────────────────────────────────────────────────

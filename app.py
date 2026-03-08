@@ -86,7 +86,7 @@ st.set_page_config(
 )
 
 st.title("🔬 Buffett Analyzer")
-st.caption("AI-powered investment research modeled on Berkshire Hathaway's analytical process")
+st.caption("v2.1 — Multi-source data with currency conversion | Not financial advice")
 
 # ── Sidebar: Configuration ──
 with st.sidebar:
