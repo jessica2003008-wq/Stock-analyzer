@@ -91,8 +91,6 @@ st.set_page_config(
 )
 
 st.title("🔬 Buffett Analyzer")
-st.caption("v2.1.1 — Currency conversion + validation | Not financial advice")
-st.info("ℹ️ Version 2.1.1 — If you see old results, click the ⋮ menu → Clear cache, then rerun.")
 
 # ── Sidebar: Configuration ──
 with st.sidebar:
