@@ -384,10 +384,11 @@ def build_report_html(report) -> str:
   --warn:#d97706;--warn-dim:rgba(217,119,6,.08);
   --radius:10px;--shadow:0 1px 3px rgba(0,0,0,.07)}}
 *{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);line-height:1.6;min-height:100vh}}
+html,body{{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);line-height:1.6}}
+/* Fixed header across full width */
 .header{{background:var(--surface);border-bottom:1px solid var(--border);padding:16px 32px;
   display:flex;align-items:center;justify-content:space-between;
-  position:sticky;top:0;z-index:100;box-shadow:var(--shadow)}}
+  position:fixed;top:0;left:0;right:0;z-index:200;height:57px;box-shadow:var(--shadow)}}
 .header-left{{display:flex;align-items:center;gap:12px}}
 .ticker-badge{{font-family:'DM Mono',monospace;font-size:13px;font-weight:500;
   background:var(--accent-dim);color:var(--accent);border:1px solid rgba(29,111,165,.3);
@@ -400,9 +401,10 @@ body{{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);li
 .rec-amber{{background:var(--warn-dim);color:var(--warn);border:1px solid rgba(217,119,6,.3)}}
 .score-pill{{font-family:'DM Mono',monospace;font-size:13px;color:var(--text-muted)}}
 .score-pill span{{color:var(--accent);font-weight:500}}
-.layout{{display:flex}}
+/* Fixed sidebar below header */
+.layout{{display:block;margin-top:57px;height:calc(100vh - 57px)}}
 .sidebar{{width:198px;background:var(--surface);border-right:1px solid var(--border);padding:18px 0;
-  position:sticky;top:57px;height:calc(100vh - 57px);overflow-y:auto;flex-shrink:0}}
+  position:fixed;top:57px;left:0;bottom:0;overflow-y:auto;z-index:100}}
 .nav-label{{font-size:10px;color:var(--text-dim);padding:8px 18px 4px;letter-spacing:1px;text-transform:uppercase}}
 .nav-item{{display:flex;align-items:center;gap:9px;padding:9px 18px;cursor:pointer;font-size:13px;
   color:var(--text-muted);border-left:2px solid transparent;transition:all .15s;white-space:nowrap;user-select:none}}
@@ -410,7 +412,9 @@ body{{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);li
 .nav-item.active{{color:var(--accent);border-left-color:var(--accent);background:var(--accent-dim);font-weight:500}}
 .nav-icon{{font-size:14px;width:16px;text-align:center}}
 .nav-divider{{height:1px;background:var(--border);margin:6px 14px}}
-.content{{flex:1;padding:26px 32px;max-width:860px;min-width:0}}
+/* Scrollable content area beside sidebar */
+.content{{position:fixed;top:57px;left:198px;right:0;bottom:0;overflow-y:auto;
+  padding:26px 32px;background:var(--bg)}}
 .tab-panel{{display:none}}.tab-panel.active{{display:block}}
 .section-header{{display:flex;align-items:baseline;gap:12px;margin-bottom:18px;padding-bottom:12px;border-bottom:1px solid var(--border)}}
 .section-title{{font-family:'Playfair Display',serif;font-size:21px;font-weight:700}}
@@ -702,7 +706,7 @@ with tab_company:
 
                 # ── Render report inline ──────────────────────────────────────
                 html = build_report_html(report)
-                components.html(html, height=820, scrolling=True)
+                components.html(html, height=700, scrolling=False)
 
                 # ── Download buttons ──────────────────────────────────────────
                 st.divider()
@@ -792,7 +796,7 @@ with tab_industry:
                     pick_tabs = st.tabs([f"#{i+1} {r.ticker}" for i, r in enumerate(report.top_5)])
                     for tab, r in zip(pick_tabs, report.top_5):
                         with tab:
-                            components.html(build_report_html(r), height=820, scrolling=True)
+                            components.html(build_report_html(r), height=700, scrolling=False)
 
                 # Downloads
                 st.divider()
