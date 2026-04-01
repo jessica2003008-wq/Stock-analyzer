@@ -384,11 +384,11 @@ def build_report_html(report) -> str:
   --warn:#d97706;--warn-dim:rgba(217,119,6,.08);
   --radius:10px;--shadow:0 1px 3px rgba(0,0,0,.07)}}
 *{{box-sizing:border-box;margin:0;padding:0}}
-html,body{{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);line-height:1.6}}
-/* Fixed header across full width */
-.header{{background:var(--surface);border-bottom:1px solid var(--border);padding:16px 32px;
-  display:flex;align-items:center;justify-content:space-between;
-  position:fixed;top:0;left:0;right:0;z-index:200;height:57px;box-shadow:var(--shadow)}}
+html{{height:100%}}
+body{{height:100%;display:flex;flex-direction:column;font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);line-height:1.6;overflow:hidden}}
+/* Header: fixed height row at top */
+.header{{flex-shrink:0;background:var(--surface);border-bottom:1px solid var(--border);padding:16px 32px;
+  display:flex;align-items:center;justify-content:space-between;height:57px;box-shadow:var(--shadow)}}
 .header-left{{display:flex;align-items:center;gap:12px}}
 .ticker-badge{{font-family:'DM Mono',monospace;font-size:13px;font-weight:500;
   background:var(--accent-dim);color:var(--accent);border:1px solid rgba(29,111,165,.3);
@@ -401,10 +401,10 @@ html,body{{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgrou
 .rec-amber{{background:var(--warn-dim);color:var(--warn);border:1px solid rgba(217,119,6,.3)}}
 .score-pill{{font-family:'DM Mono',monospace;font-size:13px;color:var(--text-muted)}}
 .score-pill span{{color:var(--accent);font-weight:500}}
-/* Fixed sidebar below header */
-.layout{{display:block;margin-top:57px;height:calc(100vh - 57px)}}
-.sidebar{{width:198px;background:var(--surface);border-right:1px solid var(--border);padding:18px 0;
-  position:fixed;top:57px;left:0;bottom:0;overflow-y:auto;z-index:100}}
+/* Layout row fills remaining height, sidebar and content each scroll independently */
+.layout{{flex:1;display:flex;overflow:hidden;min-height:0}}
+.sidebar{{width:198px;flex-shrink:0;background:var(--surface);border-right:1px solid var(--border);
+  padding:18px 0;overflow-y:auto}}
 .nav-label{{font-size:10px;color:var(--text-dim);padding:8px 18px 4px;letter-spacing:1px;text-transform:uppercase}}
 .nav-item{{display:flex;align-items:center;gap:9px;padding:9px 18px;cursor:pointer;font-size:13px;
   color:var(--text-muted);border-left:2px solid transparent;transition:all .15s;white-space:nowrap;user-select:none}}
@@ -412,9 +412,8 @@ html,body{{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgrou
 .nav-item.active{{color:var(--accent);border-left-color:var(--accent);background:var(--accent-dim);font-weight:500}}
 .nav-icon{{font-size:14px;width:16px;text-align:center}}
 .nav-divider{{height:1px;background:var(--border);margin:6px 14px}}
-/* Scrollable content area beside sidebar */
-.content{{position:fixed;top:57px;left:198px;right:0;bottom:0;overflow-y:auto;
-  padding:26px 32px;background:var(--bg)}}
+/* Content scrolls independently */
+.content{{flex:1;overflow-y:auto;padding:26px 32px;background:var(--bg);min-width:0}}
 .tab-panel{{display:none}}.tab-panel.active{{display:block}}
 .section-header{{display:flex;align-items:baseline;gap:12px;margin-bottom:18px;padding-bottom:12px;border-bottom:1px solid var(--border)}}
 .section-title{{font-family:'Playfair Display',serif;font-size:21px;font-weight:700}}
