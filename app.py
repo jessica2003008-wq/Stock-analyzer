@@ -952,6 +952,215 @@ def tab_conclusion(r) -> str:
     return _wrap(inner)
 
 
+
+
+def render_valuation_native(report):
+    """Valuation tab rendered entirely with Streamlit native widgets — no iframe."""
+    import numpy as np
+
+    v   = report.valuation
+    m   = report.margin_of_safety
+    cs  = "¥" if getattr(report, "currency", "") == "CNY" else "$"
+
+    def fmt_money(val):
+        if val is None: return "N/A"
+        try: return f"{cs}{float(val):,.2f}"
+        except: return str(val)
+
+    def fmt_pct(val):
+        if val is None: return "N/A"
+        try: return f"{float(val):.1f}%"
+        except: return str(val)
+
+    # ── Top metrics ──────────────────────────────────────────────────────────
+    mc1, mc2, mc3, mc4, mc5, mc6 = st.columns(6)
+    mc1.metric("Current Price",    fmt_money(v.current_price))
+    mc2.metric("Base IV",          fmt_money(v.base.per_share_value))
+    mc3.metric("Margin of Safety", fmt_pct(m.margin_of_safety_pct))
+    mc4.metric("EPV / Share",      fmt_money(v.epv_per_share))
+    mc5.metric("Bull Upside",      fmt_pct(m.bull_upside_pct))
+    mc6.metric("Bear Downside",    fmt_pct(m.bear_downside_pct))
+
+    st.markdown("---")
+    st.caption("👇 Click **▶ Detail** on any scenario to see full calculation and edit parameters")
+
+    # ── Scenario table + expanders ────────────────────────────────────────────
+    scenarios = [
+        ("🟢 Bull", v.bull,  "bull"),
+        ("🟡 Base", v.base,  "base"),
+        ("🔴 Bear", v.bear,  "bear"),
+    ]
+
+    def run_dcf(oe, g, dr, tg, proj_years=10):
+        """Re-run 2-stage DCF with given params, return (cfs, tv, pv_cf, pv_tv, total, per_share)."""
+        fade = min(5, proj_years)
+        if dr <= tg:
+            tg = dr - 0.01
+        cfs, prev = [], oe
+        for t in range(1, proj_years + 1):
+            g_rate = g if t <= fade else g + (tg - g) * ((t - fade) / (proj_years - fade))
+            cf = prev * (1 + g_rate)
+            cfs.append(cf)
+            prev = cf
+        tv     = cfs[-1] * (1 + tg) / (dr - tg)
+        pv_cf  = sum(cf / (1 + dr) ** (i + 1) for i, cf in enumerate(cfs))
+        pv_tv  = tv / (1 + dr) ** proj_years
+        total  = pv_cf + pv_tv
+        shares = (v.base.present_value / v.base.per_share_value
+                  if v.base.present_value > 0 and v.base.per_share_value > 0 else 1)
+        per_share = total / shares if shares > 0 else 0
+        return cfs, tv, pv_cf, pv_tv, total, per_share
+
+    for label, sc, key in scenarios:
+        iv  = sc.per_share_value or 0
+        vsp = f"{((iv / v.current_price) - 1) * 100:+.1f}%" if iv and v.current_price else "N/A"
+
+        # One-line summary row
+        cols = st.columns([2, 1.5, 1.5, 1.5, 2, 1.5, 1])
+        cols[0].markdown(f"**{label}**")
+        cols[1].markdown(f"`{sc.growth_rate:.1%}` growth")
+        cols[2].markdown(f"`{sc.discount_rate:.0%}` discount")
+        cols[3].markdown(f"`{sc.terminal_growth_rate:.0%}` terminal")
+        cols[4].markdown(f"**{fmt_money(iv)}** / share")
+        cols[5].markdown(vsp)
+
+        with st.expander(f"▶ Detail & Edit — {label.split()[-1]}", expanded=False):
+
+            st.markdown(f"#### {label} — DCF Breakdown")
+
+            # ── Editable parameters ─────────────────────────────────────────
+            st.markdown("**Edit parameters and recalculate:**")
+            p1, p2, p3, p4, p5 = st.columns(5)
+            oe_m  = p1.number_input("Owner Earnings (M)",
+                        value=round(sc.owner_earnings / 1e6, 1),
+                        step=1.0, key=f"{key}_oe")
+            g_pct = p2.number_input("Growth Rate (%)",
+                        value=round(sc.growth_rate * 100, 1),
+                        step=0.1, min_value=-20.0, max_value=80.0, key=f"{key}_g")
+            dr_pct= p3.number_input("Discount Rate (%)",
+                        value=round(sc.discount_rate * 100, 1),
+                        step=0.1, min_value=1.0, max_value=30.0, key=f"{key}_dr")
+            tg_pct= p4.number_input("Terminal Growth (%)",
+                        value=round(sc.terminal_growth_rate * 100, 1),
+                        step=0.1, min_value=0.0, max_value=10.0, key=f"{key}_tg")
+            mc_m  = p5.number_input("Maint CapEx (M)",
+                        value=round((sc.maintenance_capex or 0) / 1e6, 1),
+                        step=1.0, key=f"{key}_mc")
+
+            # Live recalculation (runs whenever any input changes)
+            new_oe = oe_m * 1e6
+            new_g  = g_pct / 100
+            new_dr = dr_pct / 100
+            new_tg = tg_pct / 100
+
+            try:
+                n_cfs, n_tv, n_pv_cf, n_pv_tv, n_total, n_ps = run_dcf(new_oe, new_g, new_dr, new_tg)
+                n_vs  = f"{((n_ps / v.current_price) - 1) * 100:+.1f}%" if v.current_price else "N/A"
+                changed = abs(n_ps - iv) > 0.01
+
+                if changed:
+                    st.success(f"**Recalculated IV: {cs}{n_ps:,.2f} / share** &nbsp;|&nbsp; vs price: {n_vs}")
+                    r1, r2, r3, r4 = st.columns(4)
+                    r1.metric("New IV / Share",    f"{cs}{n_ps:,.2f}", delta=f"{n_ps-iv:+.2f}")
+                    r2.metric("PV of Cash Flows",  f"{cs}{n_pv_cf/1e6:.0f}M")
+                    r3.metric("PV of Terminal",    f"{cs}{n_pv_tv/1e6:.0f}M")
+                    r4.metric("% from Terminal",   f"{n_pv_tv/n_total*100:.0f}%" if n_total else "N/A")
+                    cfs_to_show, tv_to_show = n_cfs, n_tv
+                else:
+                    cfs_to_show = sc.projected_cash_flows or []
+                    tv_to_show  = sc.terminal_value or 0
+            except Exception:
+                cfs_to_show = sc.projected_cash_flows or []
+                tv_to_show  = sc.terminal_value or 0
+
+            st.markdown("---")
+
+            # ── Two-column detail ───────────────────────────────────────────
+            dl, dr_col = st.columns([1, 1])
+
+            with dl:
+                # Assumptions
+                st.markdown("**📋 Assumptions used**")
+                for assumption in (sc.assumptions or []):
+                    st.caption(f"› {assumption}")
+                if sc.maintenance_capex_method:
+                    st.caption(f"› Maint CapEx: {sc.maintenance_capex_method}")
+
+            with dr_col:
+                # PV breakdown
+                st.markdown("**💰 PV Breakdown**")
+                if sc.present_value and sc.terminal_value:
+                    pv_tv_orig = sc.terminal_value / (1 + sc.discount_rate) ** 10
+                    pv_cf_orig = max(sc.present_value - pv_tv_orig, 0)
+                    pv_tv_orig = sc.present_value - pv_cf_orig
+                    b1, b2 = st.columns(2)
+                    b1.metric("PV of Cash Flows",
+                              f"{cs}{pv_cf_orig/1e6:.0f}M",
+                              f"{pv_cf_orig/sc.present_value*100:.0f}% of total")
+                    b2.metric("PV of Terminal Value",
+                              f"{cs}{pv_tv_orig/1e6:.0f}M",
+                              f"{pv_tv_orig/sc.present_value*100:.0f}% of total")
+                    st.metric("Total Enterprise Value", f"{cs}{sc.present_value/1e6:.0f}M")
+
+            # ── Cash flow chart ─────────────────────────────────────────────
+            if cfs_to_show:
+                st.markdown("**📈 Projected Cash Flows**")
+                import pandas as pd
+                years = [f"Yr {i+1}" for i in range(len(cfs_to_show))]
+                df_cf = pd.DataFrame({"Year": years, f"Cash Flow ({cs}M)": [cf/1e6 for cf in cfs_to_show]})
+                st.bar_chart(df_cf.set_index("Year"), height=200)
+                if tv_to_show:
+                    st.caption(f"Terminal Value: {cs}{tv_to_show/1e6:.0f}M")
+
+        st.markdown("")  # spacer between scenarios
+
+    # ── EPV expander ─────────────────────────────────────────────────────────
+    cols = st.columns([2, 1.5, 1.5, 1.5, 2, 1.5, 1])
+    cols[0].markdown("**⚪ EPV**")
+    cols[1].markdown("`0%` growth")
+    cols[2].markdown(f"`{v.base.discount_rate:.0%}` discount")
+    cols[3].markdown("—")
+    cols[4].markdown(f"**{fmt_money(v.epv_per_share)}** / share")
+    epv_vs = f"{((v.epv_per_share / v.current_price) - 1) * 100:+.1f}%" if v.epv_per_share and v.current_price else "N/A"
+    cols[5].markdown(epv_vs)
+
+    with st.expander("▶ Detail — EPV (Earnings Power Value)", expanded=False):
+        st.markdown("#### EPV — Zero-Growth Assumption")
+        st.info(f"**Formula:** EPV = Owner Earnings ÷ Discount Rate  \n"
+                f"= {cs}{v.base.owner_earnings/1e6:.1f}M ÷ {v.base.discount_rate:.0%}  \n"
+                f"= **{cs}{v.epv/1e6:.0f}M** total  \n"
+                f"= **{cs}{v.epv_per_share:,.2f} per share**")
+        st.caption("EPV assumes zero earnings growth — a conservative floor value. "
+                   "If IV > EPV, growth is required to justify the price.")
+
+    st.markdown("---")
+
+    # ── Sensitivity table ─────────────────────────────────────────────────────
+    if v.sensitivity_table:
+        st.markdown("**Sensitivity Table — Discount Rate × Terminal Growth**")
+        import pandas as pd
+        rows = []
+        for row in v.sensitivity_table:
+            dr = row.get("discount_rate", 0)
+            rows.append({
+                "Discount Rate": f"{dr:.0%}",
+                f"TG 2%": f"{cs}{row.get('tg_2%',0):,.0f}",
+                f"TG 3%": f"{cs}{row.get('tg_3%',0):,.0f}",
+                f"TG 4%": f"{cs}{row.get('tg_4%',0):,.0f}",
+            })
+        st.dataframe(pd.DataFrame(rows).set_index("Discount Rate"), use_container_width=True)
+        st.caption("Values are per-share intrinsic value estimates at the given discount/terminal growth combination.")
+
+    st.markdown("---")
+
+    # ── Evidence trail ────────────────────────────────────────────────────────
+    with st.expander("📋 Full Calculation Evidence Trail", expanded=False):
+        for e in (v.evidence or []):
+            st.caption(f"› {e}")
+
+    st.caption(v.rationale or "")
+    st.caption(f"MoS Verdict: **{m.verdict or ''}** — {m.rationale or ''}")
+
 def render_report(report):
     """Render a full report using Streamlit native tabs."""
     rec = report.recommendation
@@ -976,7 +1185,7 @@ def render_report(report):
     with t1: components.html(tab_overview(report),    height=620, scrolling=True)
     with t2: components.html(tab_moat(report),        height=520, scrolling=True)
     with t3: components.html(tab_financials(report),  height=620, scrolling=True)
-    with t4: components.html(tab_valuation(report),   height=700, scrolling=True)
+    with t4: render_valuation_native(report)
     with t5: components.html(tab_risks(report),       height=500, scrolling=True)
     with t6: components.html(tab_news(report),        height=600, scrolling=True)
     with t7: components.html(tab_conclusion(report),  height=580, scrolling=True)
