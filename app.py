@@ -369,27 +369,75 @@ def tab_financials(r) -> str:
 
 
 def tab_valuation(r) -> str:
+    import json as _json
     v  = r.valuation
     m  = r.margin_of_safety
     cs = "¥" if getattr(r, "currency", "") == "CNY" else "$"
 
+    def heat(val):
+        if not v.current_price or not val: return ""
+        r2 = val / v.current_price
+        return "heat-1" if r2>2 else ("heat-2" if r2>1.5 else ("heat-3" if r2>1 else ("heat-4" if r2>0.7 else "heat-5")))
+
+    # ── Scenario rows (clickable) ──────────────────────────────────────────
     scen = ""
     for name, sc, col in [("Bull",v.bull,"green"),("Base",v.base,"amber"),("Bear",v.bear,"red")]:
         iv = sc.per_share_value
-        if iv and v.current_price:
-            vsp = f"{((iv/v.current_price)-1)*100:+.1f}%"
-            vc  = "green" if iv > v.current_price else "red"
-        else: vsp, vc = "N/A", ""
-        scen += f"<tr><td><strong>{name}</strong></td><td class='mono'>{sc.growth_rate:.1%}</td><td class='mono'>{sc.discount_rate:.0%}</td><td class='mono'>{sc.terminal_growth_rate:.0%}</td><td class='mono {col}'>{_money(iv,cs)}</td><td class='mono {vc}'>{vsp}</td></tr>"
+        vsp = f"{((iv/v.current_price)-1)*100:+.1f}%" if iv and v.current_price else "N/A"
+        vc  = "green" if iv and v.current_price and iv > v.current_price else "red"
+        # embed full scenario data as JSON for the drawer
+        sc_data = _json.dumps({
+            "label": name,
+            "owner_earnings": sc.owner_earnings,
+            "growth_rate": sc.growth_rate,
+            "discount_rate": sc.discount_rate,
+            "terminal_growth_rate": sc.terminal_growth_rate,
+            "maintenance_capex": sc.maintenance_capex,
+            "maintenance_capex_method": sc.maintenance_capex_method,
+            "projected_cash_flows": sc.projected_cash_flows,
+            "terminal_value": sc.terminal_value,
+            "present_value": sc.present_value,
+            "per_share_value": sc.per_share_value,
+            "assumptions": sc.assumptions,
+            "current_price": v.current_price,
+            "cs": cs,
+        }, ensure_ascii=False).replace("'", "&#39;")
+        scen += f"""<tr class="scen-row" onclick="openDrawer('{name}', '{sc_data}')" title="Click to see calculation">
+          <td><strong>{name}</strong> <span style="font-size:11px;color:var(--accent)">↗ detail</span></td>
+          <td class="mono clickval" onclick="event.stopPropagation();openDrawer('{name}','{sc_data}')">{sc.growth_rate:.1%}</td>
+          <td class="mono clickval" onclick="event.stopPropagation();openDrawer('{name}','{sc_data}')">{sc.discount_rate:.0%}</td>
+          <td class="mono clickval" onclick="event.stopPropagation();openDrawer('{name}','{sc_data}')">{sc.terminal_growth_rate:.0%}</td>
+          <td class="mono {col} clickval" onclick="event.stopPropagation();openDrawer('{name}','{sc_data}')">{_money(iv,cs)}</td>
+          <td class="mono {vc}">{vsp}</td></tr>"""
+
     if v.epv_per_share and v.current_price:
         ec = "green" if v.epv_per_share > v.current_price else "red"
-        scen += f"<tr><td><strong>EPV</strong></td><td class='mono'>0%</td><td class='mono'>—</td><td class='mono'>—</td><td class='mono'>{_money(v.epv_per_share,cs)}</td><td class='mono {ec}'>{((v.epv_per_share/v.current_price)-1)*100:+.1f}%</td></tr>"
+        epv_pct = f"{((v.epv_per_share/v.current_price)-1)*100:+.1f}%"
+        epv_data = _json.dumps({
+            "label": "EPV",
+            "owner_earnings": v.base.owner_earnings,
+            "growth_rate": 0,
+            "discount_rate": v.base.discount_rate,
+            "terminal_growth_rate": 0,
+            "epv": v.epv,
+            "per_share_value": v.epv_per_share,
+            "current_price": v.current_price,
+            "cs": cs,
+            "assumptions": [
+                f"EPV = Owner Earnings / Discount Rate (no growth assumed)",
+                f"Owner Earnings: {cs}{v.base.owner_earnings:,.0f}",
+                f"Discount Rate: {v.base.discount_rate:.0%}",
+                f"EPV (total): {cs}{v.epv:,.0f}",
+                f"EPV / Share: {cs}{v.epv_per_share:,.2f}",
+            ]
+        }, ensure_ascii=False).replace("'", "&#39;")
+        scen += f"""<tr class="scen-row" onclick="openDrawer('EPV','{epv_data}')" title="Click to see calculation">
+          <td><strong>EPV</strong> <span style="font-size:11px;color:var(--accent)">↗ detail</span></td>
+          <td class="mono">0%</td><td class="mono">—</td><td class="mono">—</td>
+          <td class="mono clickval">{_money(v.epv_per_share,cs)}</td>
+          <td class="mono {ec}">{epv_pct}</td></tr>"""
 
-    def heat(val):
-        if not v.current_price or not val: return ""
-        r2 = val/v.current_price
-        return "heat-1" if r2>2 else ("heat-2" if r2>1.5 else ("heat-3" if r2>1 else ("heat-4" if r2>0.7 else "heat-5")))
-
+    # ── Sensitivity table ──────────────────────────────────────────────────
     sens = ""
     if v.sensitivity_table:
         sr = ""
@@ -400,27 +448,379 @@ def tab_valuation(r) -> str:
           <table><thead><tr><th>Discount</th><th>TG 2%</th><th>TG 3%</th><th>TG 4%</th></tr></thead><tbody>{sr}</tbody></table>
           <p style="font-size:12px;color:var(--text-dim);margin-top:8px">Green = significant upside. Red = near or below current price.</p></div>"""
 
-    mc = "green" if (m.margin_of_safety_pct or 0)>25 else ("amber" if (m.margin_of_safety_pct or 0)>0 else "red")
+    # ── Evidence trail ─────────────────────────────────────────────────────
+    evidence_items = "".join(
+        f'<li style="font-family:\'DM Mono\',monospace;font-size:12px;color:var(--text-muted);padding:3px 0 3px 14px;position:relative">{e}</li>'
+        for e in (v.evidence or [])
+    )
+
+    mc_color = "green" if (m.margin_of_safety_pct or 0)>25 else ("amber" if (m.margin_of_safety_pct or 0)>0 else "red")
+
     inner = f"""
-    <div class="section-header">
-      <span class="section-step">Step 5 + 6</span>
-      <span class="section-title">Intrinsic Value &amp; Margin of Safety</span>
-      <span class="score-chip {_sc(m.score)}">MoS {int(m.score or 0)}/100 · {_pct(m.margin_of_safety_pct)}</span>
+<!-- ── Drawer overlay ── -->
+<div id="drawer-overlay" onclick="closeDrawer()" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:900"></div>
+
+<!-- ── Drawer panel ── -->
+<div id="drawer" style="display:none;position:fixed;top:0;right:0;width:520px;height:100%;
+  background:#fff;box-shadow:-4px 0 24px rgba(0,0,0,.12);z-index:901;
+  overflow-y:auto;font-family:'DM Sans',sans-serif">
+
+  <!-- Drawer header -->
+  <div style="padding:18px 22px 14px;border-bottom:1px solid var(--border);
+    display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;background:#fff;z-index:10">
+    <div>
+      <div id="d-title" style="font-family:'Playfair Display',serif;font-size:18px;font-weight:700"></div>
+      <div id="d-sub"   style="font-size:12px;color:var(--text-muted);margin-top:2px"></div>
     </div>
-    <div class="metrics-grid">
-      <div class="metric"><div class="metric-label">Current Price</div><div class="metric-value">{_money(v.current_price,cs)}</div></div>
-      <div class="metric"><div class="metric-label">Base IV</div><div class="metric-value green">{_money(v.base.per_share_value,cs)}</div></div>
-      <div class="metric"><div class="metric-label">Margin of Safety</div><div class="metric-value {mc}">{_pct(m.margin_of_safety_pct)}</div></div>
-      <div class="metric"><div class="metric-label">EPV / Share</div><div class="metric-value amber">{_money(v.epv_per_share,cs)}</div></div>
-      <div class="metric"><div class="metric-label">Bull Upside</div><div class="metric-value green">{_pct(m.bull_upside_pct)}</div></div>
-      <div class="metric"><div class="metric-label">Bear Downside</div><div class="metric-value red">{_pct(m.bear_downside_pct)}</div></div>
+    <button onclick="closeDrawer()" style="border:none;background:none;font-size:20px;cursor:pointer;color:var(--text-muted);padding:4px 8px">✕</button>
+  </div>
+
+  <!-- Result badge -->
+  <div style="padding:14px 22px;background:var(--surface2);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:14px">
+    <div>
+      <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:3px">Intrinsic Value / Share</div>
+      <div id="d-iv" style="font-family:'DM Mono',monospace;font-size:26px;font-weight:500"></div>
     </div>
-    <div class="card"><div class="card-title">Scenario Range vs Current Price</div>
-      <table><thead><tr><th>Scenario</th><th>Growth</th><th>Discount</th><th>Term. Growth</th><th>Per Share IV</th><th>vs Price</th></tr></thead>
-      <tbody>{scen}</tbody></table></div>
-    {sens}
-    <div class="card"><div class="card-title">Valuation Rationale</div><p>{v.rationale or ''}</p></div>
-    <div class="card"><div class="card-title">MoS Verdict: {m.verdict or ''}</div><p>{m.rationale or ''}</p></div>"""
+    <div style="margin-left:auto;text-align:right">
+      <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:3px">vs Market Price</div>
+      <div id="d-vs" style="font-family:'DM Mono',monospace;font-size:20px;font-weight:500"></div>
+    </div>
+  </div>
+
+  <div style="padding:18px 22px">
+
+    <!-- ── Parameters (editable) ── -->
+    <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px;font-weight:600">
+      Parameters — edit &amp; recalculate ✏️
+    </div>
+    <div id="d-params" style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px"></div>
+    <button onclick="recalc()" style="width:100%;padding:9px;background:var(--accent);color:#fff;
+      border:none;border-radius:8px;font-size:14px;font-weight:500;cursor:pointer;font-family:'DM Sans',sans-serif;margin-bottom:18px">
+      ↻ Recalculate DCF
+    </button>
+
+    <!-- ── Recalc result ── -->
+    <div id="d-recalc-result" style="display:none;margin-bottom:18px"></div>
+
+    <!-- ── Assumptions ── -->
+    <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;font-weight:600">
+      Assumptions used
+    </div>
+    <div id="d-assumptions" style="background:var(--surface2);border:1px solid var(--border);
+      border-radius:8px;padding:12px;margin-bottom:16px"></div>
+
+    <!-- ── Cash flow waterfall ── -->
+    <div id="d-cf-section">
+      <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;font-weight:600">
+        Projected Cash Flows (Owner Earnings)
+      </div>
+      <div id="d-cashflows"></div>
+    </div>
+
+    <!-- ── PV breakdown ── -->
+    <div id="d-pv-section" style="margin-top:14px">
+      <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;font-weight:600">
+        Present Value Breakdown
+      </div>
+      <div id="d-pv-breakdown"></div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ── Main content ── -->
+<div class="section-header">
+  <span class="section-step">Step 5 + 6</span>
+  <span class="section-title">Intrinsic Value &amp; Margin of Safety</span>
+  <span class="score-chip {_sc(m.score)}">MoS {int(m.score or 0)}/100 · {_pct(m.margin_of_safety_pct)}</span>
+</div>
+
+<div style="font-size:12px;color:var(--accent);background:var(--accent-dim);border:1px solid rgba(29,111,165,.2);
+  border-radius:6px;padding:8px 12px;margin-bottom:14px">
+  💡 <strong>Click any scenario row or value</strong> to see full calculation steps and edit parameters.
+</div>
+
+<div class="metrics-grid">
+  <div class="metric"><div class="metric-label">Current Price</div><div class="metric-value">{_money(v.current_price,cs)}</div></div>
+  <div class="metric clickval" onclick="openDrawer('Base', JSON.stringify(window._scData.Base).replace(/'/g,&quot;&#39;&quot;))" title="Click for Base IV breakdown">
+    <div class="metric-label">Base IV ↗</div><div class="metric-value green">{_money(v.base.per_share_value,cs)}</div></div>
+  <div class="metric"><div class="metric-label">Margin of Safety</div><div class="metric-value {mc_color}">{_pct(m.margin_of_safety_pct)}</div></div>
+  <div class="metric"><div class="metric-label">EPV / Share</div><div class="metric-value amber">{_money(v.epv_per_share,cs)}</div></div>
+  <div class="metric"><div class="metric-label">Bull Upside</div><div class="metric-value green">{_pct(m.bull_upside_pct)}</div></div>
+  <div class="metric"><div class="metric-label">Bear Downside</div><div class="metric-value red">{_pct(m.bear_downside_pct)}</div></div>
+</div>
+
+<div class="card">
+  <div class="card-title">Scenario Range — click any row for full breakdown</div>
+  <table>
+    <thead><tr><th>Scenario</th><th>Growth</th><th>Discount</th><th>Term. Growth</th><th>Per Share IV</th><th>vs Price</th></tr></thead>
+    <tbody>{scen}</tbody>
+  </table>
+</div>
+
+{sens}
+
+<div class="card">
+  <div class="card-title">Calculation Evidence Trail</div>
+  <ul style="list-style:none;padding:0">{evidence_items}</ul>
+</div>
+
+<div class="card"><div class="card-title">Valuation Rationale</div><p>{v.rationale or ''}</p></div>
+<div class="card"><div class="card-title">MoS Verdict: {m.verdict or ''}</div><p>{m.rationale or ''}</p></div>
+
+<style>
+.scen-row {{ cursor:pointer; transition:background .15s; }}
+.scen-row:hover td {{ background:var(--accent-dim) !important; }}
+.clickval {{ cursor:pointer; text-decoration:underline dotted var(--accent); }}
+.clickval:hover {{ color:var(--accent) !important; }}
+.inp-field {{ width:100%;padding:7px 10px;border:1px solid var(--border);border-radius:6px;
+  font-family:'DM Mono',monospace;font-size:13px;color:var(--text);background:var(--surface2);
+  box-sizing:border-box; }}
+.inp-field:focus {{ outline:none;border-color:var(--accent); }}
+.inp-label {{ font-size:11px;color:var(--text-muted);margin-bottom:4px; }}
+.cf-bar-wrap {{ display:flex;align-items:center;gap:8px;margin-bottom:6px; }}
+.cf-year {{ font-family:'DM Mono',monospace;font-size:11px;color:var(--text-dim);width:36px;flex-shrink:0; }}
+.cf-bar {{ height:18px;background:var(--accent-dim);border-radius:3px;min-width:4px;transition:width .3s; }}
+.cf-val {{ font-family:'DM Mono',monospace;font-size:12px;color:var(--text-muted);white-space:nowrap; }}
+</style>
+
+<script>
+// Store full scenario data for onclick access from metric cards
+window._scData = {{}};
+</script>
+
+<script>
+// ── Data embedded from Python ──────────────────────────────────────────────
+var _PRICE = {v.current_price};
+var _CS    = "{cs}";
+
+// Store scenarios keyed by name
+var _scenarios = {{}};
+
+function _storeScenario(name, data) {{
+  _scenarios[name] = data;
+  window._scData[name] = data;
+}}
+
+{chr(10).join(
+    f"_storeScenario('{sc_name}', {_json.dumps({'label':sc_name,'owner_earnings':sc_obj.owner_earnings,'growth_rate':sc_obj.growth_rate,'discount_rate':sc_obj.discount_rate,'terminal_growth_rate':sc_obj.terminal_growth_rate,'maintenance_capex':sc_obj.maintenance_capex,'maintenance_capex_method':sc_obj.maintenance_capex_method,'projected_cash_flows':sc_obj.projected_cash_flows,'terminal_value':sc_obj.terminal_value,'present_value':sc_obj.present_value,'per_share_value':sc_obj.per_share_value,'assumptions':sc_obj.assumptions,'current_price':v.current_price,'cs':cs}, ensure_ascii=False)});"
+    for sc_name, sc_obj in [("Bull", v.bull), ("Base", v.base), ("Bear", v.bear)]
+)}
+
+// ── Drawer open/close ─────────────────────────────────────────────────────
+var _curData = null;
+
+function openDrawer(name, dataStr) {{
+  var data;
+  if (typeof dataStr === 'string') {{
+    try {{ data = JSON.parse(dataStr.replace(/&#39;/g,"'")); }} catch(e) {{ data = _scenarios[name] || {{}}; }}
+  }} else {{
+    data = dataStr;
+  }}
+  if (!data || Object.keys(data).length === 0) data = _scenarios[name] || {{}};
+  _curData = data;
+
+  var colors = {{Bull:'#059669', Base:'#d97706', Bear:'#dc2626', EPV:'#2563eb'}};
+  var col = colors[name] || '#1d6fa5';
+
+  document.getElementById('d-title').textContent = name + ' Scenario — DCF Calculation';
+  document.getElementById('d-sub').textContent   = 'Owner Earnings DCF · 2-Stage · Click values to edit';
+
+  var iv  = data.per_share_value || 0;
+  var prc = data.current_price   || _PRICE;
+  var csp = data.cs || _CS;
+
+  document.getElementById('d-iv').textContent  = csp + iv.toLocaleString('en', {{minimumFractionDigits:2, maximumFractionDigits:2}});
+  document.getElementById('d-iv').style.color  = col;
+
+  var vsPct = prc > 0 ? ((iv / prc - 1) * 100) : 0;
+  document.getElementById('d-vs').textContent  = (vsPct >= 0 ? '+' : '') + vsPct.toFixed(1) + '%';
+  document.getElementById('d-vs').style.color  = vsPct >= 0 ? '#059669' : '#dc2626';
+
+  renderParams(data);
+  renderAssumptions(data);
+  renderCashFlows(data, col);
+  renderPVBreakdown(data, col);
+
+  document.getElementById('d-recalc-result').style.display = 'none';
+  document.getElementById('drawer-overlay').style.display  = 'block';
+  document.getElementById('drawer').style.display          = 'block';
+}}
+
+function closeDrawer() {{
+  document.getElementById('drawer').style.display          = 'none';
+  document.getElementById('drawer-overlay').style.display  = 'none';
+}}
+
+// ── Editable parameter inputs ─────────────────────────────────────────────
+function renderParams(data) {{
+  var fields = [
+    {{key:'owner_earnings',   label:'Owner Earnings',    fmt: function(v){{return (v/1e6).toFixed(1);}},  suffix:'M',  parse: function(s){{return parseFloat(s)*1e6;}}}},
+    {{key:'growth_rate',      label:'Growth Rate (Stg 1)', fmt: function(v){{return (v*100).toFixed(1);}}, suffix:'%',  parse: function(s){{return parseFloat(s)/100;}}}},
+    {{key:'discount_rate',    label:'Discount Rate',     fmt: function(v){{return (v*100).toFixed(1);}},  suffix:'%',  parse: function(s){{return parseFloat(s)/100;}}}},
+    {{key:'terminal_growth_rate', label:'Terminal Growth', fmt: function(v){{return (v*100).toFixed(1);}}, suffix:'%', parse: function(s){{return parseFloat(s)/100;}}}},
+    {{key:'maintenance_capex', label:'Maintenance CapEx', fmt: function(v){{return (v/1e6).toFixed(1);}}, suffix:'M', parse: function(s){{return parseFloat(s)*1e6;}}}},
+  ];
+  var html = '';
+  for (var i=0; i<fields.length; i++) {{
+    var f   = fields[i];
+    var val = data[f.key];
+    if (val === undefined || val === null) continue;
+    html += '<div><div class="inp-label">' + f.label + '</div>' +
+            '<div style="display:flex;align-items:center;gap:4px">' +
+            '<input class="inp-field" id="inp-' + f.key + '" type="number" step="any" ' +
+            'value="' + f.fmt(val) + '" data-parse="' + i + '">' +
+            '<span style="font-size:12px;color:var(--text-muted)">' + f.suffix + '</span></div></div>';
+  }}
+  document.getElementById('d-params').innerHTML = html;
+  // store parsers for recalc
+  document.getElementById('d-params')._fields = fields;
+}}
+
+// ── Recalculate DCF in JS ─────────────────────────────────────────────────
+function recalc() {{
+  if (!_curData) return;
+  var container = document.getElementById('d-params');
+  var fields     = container._fields;
+  var data       = JSON.parse(JSON.stringify(_curData));  // clone
+
+  for (var i=0; i<fields.length; i++) {{
+    var inp = document.getElementById('inp-' + fields[i].key);
+    if (inp) {{
+      var parsed = fields[i].parse(inp.value);
+      if (!isNaN(parsed)) data[fields[i].key] = parsed;
+    }}
+  }}
+
+  // Run 2-stage DCF (matches Python logic)
+  var oe          = data.owner_earnings;
+  var g           = data.growth_rate;
+  var dr          = data.discount_rate;
+  var tg          = data.terminal_growth_rate;
+  var projYears   = 10;
+  var fadeStart   = 5;
+  var csp         = data.cs || _CS;
+  var prc         = data.current_price || _PRICE;
+
+  if (dr <= tg) tg = dr - 0.01;
+
+  var cfs = [], prevCf = oe;
+  for (var t=1; t<=projYears; t++) {{
+    var gRate = t <= fadeStart ? g : g + (tg - g) * ((t - fadeStart) / (projYears - fadeStart));
+    var cf    = prevCf * (1 + gRate);
+    cfs.push(cf);
+    prevCf = cf;
+  }}
+  var finalCf = cfs[cfs.length-1];
+  var tv      = finalCf * (1 + tg) / (dr - tg);
+  var pvCfs   = cfs.reduce(function(acc,cf,i){{return acc + cf/Math.pow(1+dr,i+1);}}, 0);
+  var pvTv    = tv / Math.pow(1+dr, projYears);
+  var totalPv = pvCfs + pvTv;
+
+  // need shares: derive from original per_share * present_value
+  var origShares = _curData.present_value > 0 && _curData.per_share_value > 0
+    ? _curData.present_value / _curData.per_share_value : 1;
+  var perShare   = origShares > 0 ? totalPv / origShares : 0;
+  var vsPct      = prc > 0 ? ((perShare/prc - 1)*100) : 0;
+  var vsColor    = vsPct >= 0 ? '#059669' : '#dc2626';
+
+  var html = '<div style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:14px">' +
+    '<div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px">Recalculated Result</div>' +
+    '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">' +
+    '<div><div style="font-size:11px;color:var(--text-muted);margin-bottom:2px">New IV / Share</div>' +
+    '<div style="font-family:\'DM Mono\',monospace;font-size:19px;font-weight:500;color:var(--accent)">' + csp + perShare.toLocaleString('en',{{minimumFractionDigits:2,maximumFractionDigits:2}}) + '</div></div>' +
+    '<div><div style="font-size:11px;color:var(--text-muted);margin-bottom:2px">vs Price</div>' +
+    '<div style="font-family:\'DM Mono\',monospace;font-size:19px;font-weight:500;color:' + vsColor + '">' + (vsPct>=0?'+':'') + vsPct.toFixed(1) + '%</div></div>' +
+    '<div><div style="font-size:11px;color:var(--text-muted);margin-bottom:2px">PV of CFs</div>' +
+    '<div style="font-family:\'DM Mono\',monospace;font-size:15px;color:var(--text-muted)">' + csp + (pvCfs/1e6).toFixed(0) + 'M</div>' +
+    '<div style="font-family:\'DM Mono\',monospace;font-size:12px;color:var(--text-dim)">+ ' + csp + (pvTv/1e6).toFixed(0) + 'M terminal</div></div>' +
+    '</div></div>';
+
+  var el = document.getElementById('d-recalc-result');
+  el.innerHTML = html;
+  el.style.display = 'block';
+
+  // Update header IV
+  document.getElementById('d-iv').textContent = csp + perShare.toLocaleString('en',{{minimumFractionDigits:2,maximumFractionDigits:2}});
+  document.getElementById('d-vs').textContent = (vsPct>=0?'+':'') + vsPct.toFixed(1) + '%';
+  document.getElementById('d-vs').style.color  = vsColor;
+}}
+
+// ── Assumptions list ──────────────────────────────────────────────────────
+function renderAssumptions(data) {{
+  var items = data.assumptions || [];
+  var html  = '<ul style="list-style:none;padding:0">';
+  for (var i=0; i<items.length; i++) {{
+    html += '<li style="font-family:\'DM Mono\',monospace;font-size:12px;color:var(--text-muted);' +
+            'padding:4px 0 4px 12px;position:relative;border-bottom:1px solid var(--border)">' +
+            '<span style="position:absolute;left:0;color:var(--text-dim)">›</span>' + items[i] + '</li>';
+  }}
+  if (data.maintenance_capex_method) {{
+    html += '<li style="font-family:\'DM Mono\',monospace;font-size:12px;color:var(--text-muted);padding:4px 0 4px 12px;position:relative">' +
+            '<span style="position:absolute;left:0;color:var(--text-dim)">›</span>Maint CapEx: ' + data.maintenance_capex_method + '</li>';
+  }}
+  html += '</ul>';
+  document.getElementById('d-assumptions').innerHTML = html;
+}}
+
+// ── Cash flow waterfall bars ──────────────────────────────────────────────
+function renderCashFlows(data, col) {{
+  var cfs = data.projected_cash_flows || [];
+  if (!cfs.length) {{ document.getElementById('d-cf-section').style.display='none'; return; }}
+  document.getElementById('d-cf-section').style.display='block';
+  var maxCf = Math.max.apply(null, cfs);
+  var csp   = data.cs || _CS;
+  var html  = '';
+  for (var i=0; i<cfs.length; i++) {{
+    var w   = maxCf > 0 ? (cfs[i]/maxCf*100) : 0;
+    var fmt = cfs[i] >= 1e9 ? (cfs[i]/1e9).toFixed(2)+'B' : (cfs[i]/1e6).toFixed(0)+'M';
+    html += '<div class="cf-bar-wrap">' +
+            '<span class="cf-year">Yr ' + (i+1) + '</span>' +
+            '<div class="cf-bar" style="width:' + w.toFixed(1) + '%;background:' + col + '22;border-left:3px solid ' + col + '"></div>' +
+            '<span class="cf-val">' + csp + fmt + '</span></div>';
+  }}
+  // Terminal value bar
+  if (data.terminal_value) {{
+    var tvFmt = data.terminal_value >= 1e9 ? (data.terminal_value/1e9).toFixed(2)+'B' : (data.terminal_value/1e6).toFixed(0)+'M';
+    var tvW   = maxCf > 0 ? Math.min(data.terminal_value/maxCf*100, 100) : 0;
+    html += '<div class="cf-bar-wrap" style="margin-top:6px;padding-top:6px;border-top:1px dashed var(--border)">' +
+            '<span class="cf-year" style="color:var(--accent)">TV</span>' +
+            '<div class="cf-bar" style="width:' + Math.min(tvW,100).toFixed(1) + '%;background:var(--accent-dim);border-left:3px solid var(--accent)"></div>' +
+            '<span class="cf-val" style="color:var(--accent)">' + csp + tvFmt + ' (terminal)</span></div>';
+  }}
+  document.getElementById('d-cashflows').innerHTML = html;
+}}
+
+// ── PV Breakdown donut-style ──────────────────────────────────────────────
+function renderPVBreakdown(data, col) {{
+  if (!data.present_value || !data.terminal_value) {{
+    document.getElementById('d-pv-section').style.display='none'; return;
+  }}
+  document.getElementById('d-pv-section').style.display='block';
+  var csp   = data.cs || _CS;
+  var pvCf  = data.present_value - (data.terminal_value / Math.pow(1 + (data.discount_rate||0.1), 10));
+  var pvTv  = data.present_value - Math.max(pvCf, 0);
+  pvCf = Math.max(pvCf, 0);
+  var pctCf = data.present_value > 0 ? (pvCf/data.present_value*100) : 50;
+  var pctTv = 100 - pctCf;
+  var fmtV  = function(v){{ return v>=1e9?(v/1e9).toFixed(2)+'B':(v/1e6).toFixed(0)+'M'; }};
+  var html =
+    '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">' +
+    '<div style="background:' + col + '11;border:1px solid ' + col + '44;border-radius:8px;padding:12px">' +
+    '<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px">PV of Cash Flows</div>' +
+    '<div style="font-family:\'DM Mono\',monospace;font-size:16px;font-weight:500;color:' + col + '">' + csp + fmtV(pvCf) + '</div>' +
+    '<div style="font-size:11px;color:var(--text-dim)">' + pctCf.toFixed(0) + '% of total</div></div>' +
+    '<div style="background:var(--accent-dim);border:1px solid rgba(29,111,165,.2);border-radius:8px;padding:12px">' +
+    '<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px">PV of Terminal Value</div>' +
+    '<div style="font-family:\'DM Mono\',monospace;font-size:16px;font-weight:500;color:var(--accent)">' + csp + fmtV(pvTv) + '</div>' +
+    '<div style="font-size:11px;color:var(--text-dim)">' + pctTv.toFixed(0) + '% of total</div></div>' +
+    '</div>' +
+    '<div style="margin-top:10px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:11px;display:flex;justify-content:space-between;align-items:center">' +
+    '<span style="font-size:13px;color:var(--text-muted)">Total Enterprise Value</span>' +
+    '<span style="font-family:\'DM Mono\',monospace;font-size:15px;font-weight:500">' + csp + fmtV(data.present_value) + '</span></div>';
+  document.getElementById('d-pv-breakdown').innerHTML = html;
+}}
+</script>"""
     return _wrap(inner)
 
 
