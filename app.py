@@ -1323,11 +1323,11 @@ with tab_company:
     with col2:
         run_company = st.button("🔍 Analyze", key="run_company", type="primary", use_container_width=True)
 
+    # Run analysis and cache in session_state
     if run_company and ticker:
         config.MIN_MOAT_SCORE = min_moat; config.MIN_FINANCIAL_SCORE = min_fq; config.MIN_STABILITY_SCORE = min_stab
         progress = st.empty()
         def company_progress(msg): progress.info(msg)
-
         with st.spinner(f"Analyzing {ticker.upper()}…"):
             try:
                 data_client = YFinanceClient()
@@ -1342,26 +1342,32 @@ with tab_company:
                     projection_years=projection_years, progress_callback=company_progress,
                 )
                 progress.empty()
-                render_report(report)
-
-                st.divider()
-                md   = report_to_markdown(report)
-                html = build_export_html(report)
-                c1, c2, c3 = st.columns(3)
-                with c1: st.download_button("📥 JSON",     data=report_to_json(report), file_name=f"{ticker.upper()}_report.json", mime="application/json")
-                with c2: st.download_button("📄 Markdown", data=md,                     file_name=f"{ticker.upper()}_report.md",   mime="text/markdown")
-                with c3: st.download_button("🌐 HTML",     data=html,                   file_name=f"{ticker.upper()}_report.html",  mime="text/html")
-
-                output_dir = os.path.join(os.path.dirname(__file__), "output")
-                os.makedirs(output_dir, exist_ok=True)
-                for fn, ct in [(f"{ticker.upper()}_report.json", report_to_json(report)),
-                               (f"{ticker.upper()}_report.md",   md),
-                               (f"{ticker.upper()}_report.html",  html)]:
-                    open(os.path.join(output_dir, fn), "w", encoding="utf-8").write(ct)
-
+                # Save to session state so parameter edits don't wipe the report
+                st.session_state["company_report"] = report
+                st.session_state["company_ticker_done"] = ticker.upper()
             except YFinanceError as e: progress.empty(); st.error(f"❌ Data Error: {e}")
             except RuntimeError  as e: progress.empty(); st.error(f"❌ {e}")
             except Exception     as e: progress.empty(); st.error(f"❌ {e}"); st.exception(e)
+
+    # Render from session_state (persists across reruns caused by number_input changes)
+    if "company_report" in st.session_state:
+        report = st.session_state["company_report"]
+        render_report(report)
+        st.divider()
+        md   = report_to_markdown(report)
+        html = build_export_html(report)
+        c1, c2, c3 = st.columns(3)
+        tk = st.session_state.get("company_ticker_done", "report")
+        with c1: st.download_button("📥 JSON",     data=report_to_json(report), file_name=f"{tk}_report.json", mime="application/json", key="dl_json_co")
+        with c2: st.download_button("📄 Markdown", data=md,                     file_name=f"{tk}_report.md",   mime="text/markdown",    key="dl_md_co")
+        with c3: st.download_button("🌐 HTML",     data=html,                   file_name=f"{tk}_report.html",  mime="text/html",       key="dl_html_co")
+
+        output_dir = os.path.join(os.path.dirname(__file__), "output")
+        os.makedirs(output_dir, exist_ok=True)
+        for fn, ct in [(f"{tk}_report.json", report_to_json(report)),
+                       (f"{tk}_report.md",   md),
+                       (f"{tk}_report.html",  html)]:
+            open(os.path.join(output_dir, fn), "w", encoding="utf-8").write(ct)
 
 # ── Industry ──────────────────────────────────────────────────────────────────
 with tab_industry:
@@ -1376,7 +1382,6 @@ with tab_industry:
         config.MIN_MOAT_SCORE = min_moat; config.MIN_FINANCIAL_SCORE = min_fq; config.MIN_STABILITY_SCORE = min_stab
         progress = st.empty()
         def industry_progress(msg): progress.info(msg)
-
         with st.spinner(f"Analyzing {industry}…"):
             try:
                 data_client = YFinanceClient()
@@ -1392,27 +1397,29 @@ with tab_industry:
                     projection_years=projection_years, progress_callback=industry_progress,
                 )
                 progress.empty()
-                st.success(f"✅ {len(report.all_reports)} companies analyzed, {len(report.top_5)} in top 5.")
-
-                if report.top_5:
-                    st.subheader("🏆 Top Picks")
-                    pick_tabs = st.tabs([f"#{i+1} {r.ticker}" for i, r in enumerate(report.top_5)])
-                    for tab, r in zip(pick_tabs, report.top_5):
-                        with tab: render_report(r)
-
-                st.divider()
-                md   = industry_report_to_markdown(report)
-                safe = industry.replace(" ","_").replace("/","_")
-                c1, c2, c3 = st.columns(3)
-                with c1: st.download_button("📥 JSON",     data=report.model_dump_json(indent=2), file_name=f"{safe}_industry.json", mime="application/json")
-                with c2: st.download_button("📄 Markdown", data=md,                               file_name=f"{safe}_industry.md",   mime="text/markdown")
-                with c3:
-                    if report.top_5:
-                        st.download_button("🌐 Top Pick HTML", data=build_export_html(report.top_5[0]),
-                                           file_name=f"{safe}_top1.html", mime="text/html")
-
+                st.session_state["industry_report"] = report
+                st.session_state["industry_name_done"] = industry
             except YFinanceError as e: progress.empty(); st.error(f"❌ Data Error: {e}")
             except Exception     as e: progress.empty(); st.error(f"❌ {e}"); st.exception(e)
+
+    if "industry_report" in st.session_state:
+        report = st.session_state["industry_report"]
+        st.success(f"✅ {len(report.all_reports)} companies analyzed, {len(report.top_5)} in top 5.")
+        if report.top_5:
+            st.subheader("🏆 Top Picks")
+            pick_tabs = st.tabs([f"#{i+1} {r.ticker}" for i, r in enumerate(report.top_5)])
+            for tab, r in zip(pick_tabs, report.top_5):
+                with tab: render_report(r)
+        st.divider()
+        md   = industry_report_to_markdown(report)
+        safe = st.session_state.get("industry_name_done","industry").replace(" ","_").replace("/","_")
+        c1, c2, c3 = st.columns(3)
+        with c1: st.download_button("📥 JSON",     data=report.model_dump_json(indent=2), file_name=f"{safe}_industry.json", mime="application/json", key="dl_json_ind")
+        with c2: st.download_button("📄 Markdown", data=md,                               file_name=f"{safe}_industry.md",   mime="text/markdown",    key="dl_md_ind")
+        with c3:
+            if report.top_5:
+                st.download_button("🌐 Top Pick HTML", data=build_export_html(report.top_5[0]),
+                                   file_name=f"{safe}_top1.html", mime="text/html", key="dl_html_ind")
 
 st.divider()
 st.caption("Buffett Analyzer v2.0 — For research purposes only. Not financial advice.")
