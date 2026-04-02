@@ -1055,21 +1055,17 @@ def render_valuation_native(report):
 
             try:
                 n_cfs, n_tv, n_pv_cf, n_pv_tv, n_total, n_ps = run_dcf(new_oe, new_g, new_dr, new_tg)
-                n_vs  = f"{((n_ps / v.current_price) - 1) * 100:+.1f}%" if v.current_price else "N/A"
-                changed = abs(n_ps - iv) > 0.01
-
-                if changed:
-                    st.success(f"**Recalculated IV: {cs}{n_ps:,.2f} / share** &nbsp;|&nbsp; vs price: {n_vs}")
-                    r1, r2, r3, r4 = st.columns(4)
-                    r1.metric("New IV / Share",    f"{cs}{n_ps:,.2f}", delta=f"{n_ps-iv:+.2f}")
-                    r2.metric("PV of Cash Flows",  f"{cs}{n_pv_cf/1e6:.0f}M")
-                    r3.metric("PV of Terminal",    f"{cs}{n_pv_tv/1e6:.0f}M")
-                    r4.metric("% from Terminal",   f"{n_pv_tv/n_total*100:.0f}%" if n_total else "N/A")
-                    cfs_to_show, tv_to_show = n_cfs, n_tv
-                else:
-                    cfs_to_show = sc.projected_cash_flows or []
-                    tv_to_show  = sc.terminal_value or 0
-            except Exception:
+                n_vs    = f"{((n_ps / v.current_price) - 1) * 100:+.1f}%" if v.current_price else "N/A"
+                delta_s = f"{n_ps - iv:+.2f}" if abs(n_ps - iv) > 0.001 else None
+                cfs_to_show, tv_to_show = n_cfs, n_tv
+                st.markdown("**\U0001f4ca Live Result**")
+                r1, r2, r3, r4 = st.columns(4)
+                r1.metric("IV / Share",       f"{cs}{n_ps:,.2f}", delta=delta_s)
+                r2.metric("vs Market Price",  n_vs)
+                r3.metric("PV of Cash Flows", f"{cs}{n_pv_cf/1e6:.0f}M")
+                r4.metric("PV of Terminal",   f"{cs}{n_pv_tv/1e6:.0f}M")
+            except Exception as e:
+                st.warning(f"Calculation error: {e}")
                 cfs_to_show = sc.projected_cash_flows or []
                 tv_to_show  = sc.terminal_value or 0
 
