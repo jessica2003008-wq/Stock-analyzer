@@ -1,348 +1,723 @@
-"""Company report assembly — runs all analysis modules and generates JSON + Markdown."""
+"""
+valuation_engine.py — Per-Company Valuation Engine (v3)
+=========================================================
+
+核心思想（借鉴 ai-hedge-fund）：
+  不同公司 → 完全不同的估值方法和参数，不是一套参数套所有
+
+公司类型 → 估值方法映射：
+  mature_quality  → 三阶段 DCF（保守，Buffett风格）
+  growth          → 高增长 DCF + FCF倍数（Cathie Wood风格）
+  value_trap      → Graham Number + Net-Net（Ben Graham风格）
+  cyclical        → 标准化盈利 + EV/EBITDA（周期均值回归）
+  distressed      → 资产清算价值（悲观为主）
+
+每种类型有独立的：
+  - 增长率计算逻辑
+  - 折现率区间
+  - 终端价值方法
+  - 置信度调整
+  - LLM prompt 人格
+"""
+
 from __future__ import annotations
-import json
-import config
-import logging
-from datetime import datetime
-from data.schemas import (
-    FinancialHistory, FilingText, CompanyReport,
-)
-from data.yfinance_client import YFinanceClient
-from data.edgar_client import EdgarClient
-from llm.claude_client import ClaudeClient, LLMError
-from analysis.circle_of_competence import analyze_circle_of_competence
-from analysis.moat_proxy import analyze_moat
-from analysis.financial_quality import analyze_financial_quality
-from analysis.stability import analyze_stability
-from analysis.valuation import analyze_valuation
-from analysis.margin_of_safety import analyze_margin_of_safety
-from analysis.recommendation import generate_recommendation
-from validation.report_validator import validate_report
+import math
+from typing import Optional, List, Literal
+from pydantic import BaseModel
 
-logger = logging.getLogger(__name__)
+# ── 公司画像（升级版，更细粒度） ──────────────────────────────────────────────
+
+CompanyType = Literal[
+    "mature_quality",   # 苹果、可口可乐：稳定现金流，宽护城河
+    "growth",           # Nvidia、Salesforce：高增长，高R&D，高倍数
+    "value_deep",       # 被低估的传统公司：Graham Number有效
+    "cyclical",         # 钢铁、汽车、能源：用标准化盈利
+    "distressed",       # 高杠杆、持续亏损：以资产价值为主
+]
+
+class CompanyProfile(BaseModel):
+    """从数据自动判断的公司画像"""
+    company_type: CompanyType
+    # 判断依据
+    revenue_cagr_5yr: float
+    gross_margin_avg: float
+    roe_avg: float
+    debt_to_equity: float
+    fcf_positive_years: int          # 近5年FCF为正的年数
+    rd_to_revenue: float             # R&D / Revenue（成长型公司关键指标）
+    revenue_volatility_cov: float    # 营收变异系数（越高越周期）
+    # 分类理由
+    classification_rationale: str
+    # 建议估值方法
+    recommended_method: str
 
 
-def run_company_analysis(
-    ticker: str,
-    data_client,  # YFinanceClient or any duck-typed client
-    llm: ClaudeClient | None = None,
-    edgar: EdgarClient | None = None,
-    discount_rate: float | None = None,
-    terminal_growth: float | None = None,
-    projection_years: int | None = None,
-    progress_callback=None,
-) -> CompanyReport:
-    """Run full Buffett-style analysis on a single company."""
-    warnings = []
-    ticker = ticker.upper()
+class ValuationParams(BaseModel):
+    """每种公司类型的专属估值参数"""
+    company_type: CompanyType
+    method_name: str
 
-    def _progress(msg: str):
-        logger.info(msg)
-        if progress_callback:
-            progress_callback(msg)
+    # DCF 参数
+    stage1_years: int = 5
+    stage2_years: int = 5
+    stage1_growth: float = 0.06
+    stage2_growth: float = 0.03
+    terminal_growth: float = 0.025
+    discount_rate: float = 0.10
 
-    # ── Data Fetch ──
-    _progress(f"[{ticker}] Fetching financial data...")
-    try:
-        history = data_client.get_financial_history(ticker)
-    except Exception as e:
-        raise RuntimeError(f"Failed to fetch financial data for {ticker}: {e}")
+    # 倍数法参数（成长型/周期型）
+    use_multiple_method: bool = False
+    terminal_fcf_multiple: float = 15.0     # 终端FCF倍数
+    normalized_earnings_years: int = 5      # 周期股标准化盈利用几年均值
 
-    if not history.statements:
-        raise RuntimeError(f"No financial statements found for {ticker}")
+    # 保守性调整
+    growth_haircut: float = 0.0             # 历史增长打折
+    iv_haircut: float = 0.0                 # 最终IV额外保守折扣
 
-    if len(history.statements) < 5:
-        warnings.append(
-            f"Only {len(history.statements)} years of data available; scores may be less reliable"
+    # 参数来源说明
+    params_rationale: List[str] = []
+
+
+# ── 公司分类器（核心函数） ─────────────────────────────────────────────────────
+
+def classify_company(
+    revenue_cagr_5yr: float,
+    gross_margin_avg: float,
+    roe_avg: float,
+    debt_to_equity: float,
+    fcf_positive_years: int,
+    rd_to_revenue: float,
+    revenue_volatility_cov: float,
+    net_income_positive_years: int,
+) -> CompanyProfile:
+    """
+    根据财务指标自动分类公司类型。
+    逻辑：先排除极端情况（distressed），再看增长特征。
+    """
+    reasons = []
+
+    # 1. 财务困境判断（优先级最高）
+    if net_income_positive_years <= 2 or debt_to_equity > 3.0 or fcf_positive_years <= 1:
+        reasons.append(f"财务困境信号：盈利年数={net_income_positive_years}，D/E={debt_to_equity:.1f}，FCF正年数={fcf_positive_years}")
+        return CompanyProfile(
+            company_type="distressed",
+            revenue_cagr_5yr=revenue_cagr_5yr,
+            gross_margin_avg=gross_margin_avg,
+            roe_avg=roe_avg,
+            debt_to_equity=debt_to_equity,
+            fcf_positive_years=fcf_positive_years,
+            rd_to_revenue=rd_to_revenue,
+            revenue_volatility_cov=revenue_volatility_cov,
+            classification_rationale="; ".join(reasons),
+            recommended_method="资产清算价值 + 悲观DCF",
         )
 
-    # ── EDGAR Filing ──
-    filing = None
-    if edgar:
-        _progress(f"[{ticker}] Fetching SEC filing text...")
-        try:
-            filing = edgar.get_latest_10k_text(ticker)
-            if not filing.sections:
-                warnings.append("EDGAR 10-K text not found; using yfinance business description instead")
-                filing = None
-        except Exception as e:
-            warnings.append(f"EDGAR fetch failed: {e}; using yfinance data only")
-            filing = None
+    # 2. 成长型判断：高增速 + 高R&D + 可接受亏损
+    if revenue_cagr_5yr >= 0.15 and rd_to_revenue >= 0.08:
+        reasons.append(f"成长型：营收CAGR={revenue_cagr_5yr:.1%}（≥15%），R&D占比={rd_to_revenue:.1%}（≥8%）")
+        return CompanyProfile(
+            company_type="growth",
+            revenue_cagr_5yr=revenue_cagr_5yr,
+            gross_margin_avg=gross_margin_avg,
+            roe_avg=roe_avg,
+            debt_to_equity=debt_to_equity,
+            fcf_positive_years=fcf_positive_years,
+            rd_to_revenue=rd_to_revenue,
+            revenue_volatility_cov=revenue_volatility_cov,
+            classification_rationale="; ".join(reasons),
+            recommended_method="高增长DCF（20%增速）+ 终端FCF倍数法",
+        )
 
-    # ── Step 1: Circle of Competence ──
-    _progress(f"[{ticker}] Step 1: Circle of Competence...")
-    competence = analyze_circle_of_competence(history, filing, llm)
+    # 仅高增速无高R&D也算成长（如平台公司）
+    if revenue_cagr_5yr >= 0.20:
+        reasons.append(f"高速成长：营收CAGR={revenue_cagr_5yr:.1%}（≥20%），暂无高R&D但增速主导")
+        return CompanyProfile(
+            company_type="growth",
+            revenue_cagr_5yr=revenue_cagr_5yr,
+            gross_margin_avg=gross_margin_avg,
+            roe_avg=roe_avg,
+            debt_to_equity=debt_to_equity,
+            fcf_positive_years=fcf_positive_years,
+            rd_to_revenue=rd_to_revenue,
+            revenue_volatility_cov=revenue_volatility_cov,
+            classification_rationale="; ".join(reasons),
+            recommended_method="高增长DCF + 终端倍数法",
+        )
 
-    # ── Step 2: Moat Proxy ──
-    _progress(f"[{ticker}] Step 2: Moat Proxy...")
-    moat = analyze_moat(history, filing, llm)
+    # 3. 周期型：营收波动大
+    if revenue_volatility_cov >= 0.20:
+        reasons.append(f"周期型：营收波动CoV={revenue_volatility_cov:.2f}（≥0.20）")
+        return CompanyProfile(
+            company_type="cyclical",
+            revenue_cagr_5yr=revenue_cagr_5yr,
+            gross_margin_avg=gross_margin_avg,
+            roe_avg=roe_avg,
+            debt_to_equity=debt_to_equity,
+            fcf_positive_years=fcf_positive_years,
+            rd_to_revenue=rd_to_revenue,
+            revenue_volatility_cov=revenue_volatility_cov,
+            classification_rationale="; ".join(reasons),
+            recommended_method="标准化盈利DCF（5年均值） + EV/EBITDA多倍数",
+        )
 
-    # ── Step 3: Financial Quality ──
-    _progress(f"[{ticker}] Step 3: Financial Quality...")
-    fq = analyze_financial_quality(history)
+    # 4. 深度价值：低增长但低估
+    if revenue_cagr_5yr < 0.05 and gross_margin_avg < 0.30 and roe_avg < 0.12:
+        reasons.append(f"深度价值型：增长={revenue_cagr_5yr:.1%}，毛利={gross_margin_avg:.1%}，ROE={roe_avg:.1%}")
+        return CompanyProfile(
+            company_type="value_deep",
+            revenue_cagr_5yr=revenue_cagr_5yr,
+            gross_margin_avg=gross_margin_avg,
+            roe_avg=roe_avg,
+            debt_to_equity=debt_to_equity,
+            fcf_positive_years=fcf_positive_years,
+            rd_to_revenue=rd_to_revenue,
+            revenue_volatility_cov=revenue_volatility_cov,
+            classification_rationale="; ".join(reasons),
+            recommended_method="Graham Number + NCAV + 保守DCF",
+        )
 
-    # ── Step 4: Stability ──
-    _progress(f"[{ticker}] Step 4: Stability...")
-    stab = analyze_stability(history)
-
-    # ── Step 5: Intrinsic Value ──
-    _progress(f"[{ticker}] Step 5: Intrinsic Value...")
-    val = analyze_valuation(history, discount_rate, terminal_growth, projection_years)
-
-    # ── Step 6: Margin of Safety ──
-    _progress(f"[{ticker}] Step 6: Margin of Safety...")
-    mos = analyze_margin_of_safety(val)
-
-    # ── Final Recommendation ──
-    _progress(f"[{ticker}] Generating recommendation...")
-    rec = generate_recommendation(competence, moat, fq, stab, val, mos)
-
-    report = CompanyReport(
-        ticker=ticker,
-        name=history.profile.name,
-        analysis_date=datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
-        competence=competence,
-        moat=moat,
-        financial_quality=fq,
-        stability=stab,
-        valuation=val,
-        margin_of_safety=mos,
-        recommendation=rec,
-        warnings=warnings,
+    # 5. 默认：成熟优质
+    reasons.append(
+        f"成熟优质：CAGR={revenue_cagr_5yr:.1%}，毛利={gross_margin_avg:.1%}，"
+        f"ROE={roe_avg:.1%}，D/E={debt_to_equity:.1f}，FCF正={fcf_positive_years}/5年"
+    )
+    return CompanyProfile(
+        company_type="mature_quality",
+        revenue_cagr_5yr=revenue_cagr_5yr,
+        gross_margin_avg=gross_margin_avg,
+        roe_avg=roe_avg,
+        debt_to_equity=debt_to_equity,
+        fcf_positive_years=fcf_positive_years,
+        rd_to_revenue=rd_to_revenue,
+        revenue_volatility_cov=revenue_volatility_cov,
+        classification_rationale="; ".join(reasons),
+        recommended_method="三阶段保守DCF（Buffett风格）",
     )
 
-    # Detect display currency for China A-shares
-    import re as _re
-    if _re.match(r'^\d{6}\.(SS|SZ)$', ticker):
-        report.currency = "CNY"
-        report.currency_note = "All values in Chinese Yuan (¥ CNY)"
 
-    # ── Validation ──
-    _progress(f"[{ticker}] Validating report...")
-    validation = validate_report(report)
-    report.validation_summary = validation.summary
-    report.validation_issues = [
-        {"severity": i.severity, "category": i.category, "message": i.message}
-        for i in validation.issues
-    ]
-    if not validation.passed:
-        warnings.append(f"VALIDATION FAILED: {validation.summary}")
-        report.warnings = warnings
+# ── 每种公司类型的专属估值参数 ────────────────────────────────────────────────
 
-    _progress(f"[{ticker}] Analysis complete. Recommendation: {rec.action} ({rec.position_size})")
-    return report
+def get_valuation_params(
+    profile: CompanyProfile,
+    market_implied_growth: Optional[float] = None,
+    analyst_forward_growth: Optional[float] = None,
+    market_pe: Optional[float] = None,
+) -> ValuationParams:
+    """
+    根据公司画像返回专属估值参数。
+    这是整个升级的核心：不同公司 → 完全不同的参数，不是一套套所有。
+    """
+    hist_g = profile.revenue_cagr_5yr
+    reasons = [f"公司类型: {profile.company_type}"]
+
+    # ════════════════════════════════════════
+    # 成熟优质：苹果、可口可乐、强生
+    # 来源：Buffett三阶段DCF
+    # ════════════════════════════════════════
+    if profile.company_type == "mature_quality":
+        # 增长：历史CAGR × 0.7（保守），再考虑analyst预期
+        g1 = _blend_growth(hist_g * 0.70, analyst_forward_growth, weight_analyst=0.35)
+        g1 = min(g1, 0.12)   # 成熟公司cap 12%
+        g2 = g1 * 0.50        # 第二阶段减速一半
+        tg = 0.025            # 终端：接近GDP增速
+
+        # 折现率：从PE反推，保守区间 8-10%
+        dr = _dr_from_pe(market_pe, lo=0.08, hi=0.10, default=0.10)
+        reasons += [
+            f"增长Stage1={g1:.1%}（历史×0.7 + analyst融合），Stage2={g2:.1%}，终端={tg:.1%}",
+            f"折现率={dr:.1%}（PE反推，区间8-10%）",
+            "终端价值：Gordon增长模型",
+            "额外保守：最终IV × 0.85（Buffett安全边际）",
+        ]
+        return ValuationParams(
+            company_type="mature_quality",
+            method_name="三阶段保守DCF（Buffett）",
+            stage1_years=5, stage2_years=5,
+            stage1_growth=g1, stage2_growth=g2,
+            terminal_growth=tg, discount_rate=dr,
+            use_multiple_method=False,
+            growth_haircut=0.0,
+            iv_haircut=0.15,   # 额外15%保守折扣
+            params_rationale=reasons,
+        )
+
+    # ════════════════════════════════════════
+    # 成长型：Nvidia、Salesforce、Shopify
+    # 来源：Cathie Wood高增长DCF + 终端倍数
+    # ════════════════════════════════════════
+    elif profile.company_type == "growth":
+        # 增长：analyst预期权重更高（成长公司analyst更准），但打折避免过度乐观
+        g1 = _blend_growth(hist_g * 0.80, analyst_forward_growth, weight_analyst=0.50)
+        g1 = min(g1, 0.35)   # 成长公司可以允许35%
+
+        # 重要：成长公司用两阶段而非三阶段
+        # 第一阶段（5年）：高速增长
+        # 直接用终端FCF倍数，不做第二阶段
+        g2 = g1 * 0.40        # 急速减速
+        tg = 0.04             # 成长公司终端增速略高
+
+        # 折现率更高：成长公司风险溢价更大
+        dr = _dr_from_pe(market_pe, lo=0.10, hi=0.15, default=0.12)
+        # 终端用倍数：25x FCF（成长公司接近市场给的倍数）
+        terminal_mult = _growth_terminal_multiple(g1)
+
+        reasons += [
+            f"增长Stage1={g1:.1%}（analyst权重50%，历史×0.8权重50%，cap35%）",
+            f"折现率={dr:.1%}（成长溢价，区间10-15%）",
+            f"终端倍数={terminal_mult:.0f}x FCF（基于增速自动计算）",
+            "注意：成长公司DCF高度依赖终端假设，结果区间宽",
+            "市场锚点权重更低（50%），模型权重50%",
+        ]
+        return ValuationParams(
+            company_type="growth",
+            method_name="高增长DCF + 终端FCF倍数（Cathie Wood风格）",
+            stage1_years=5, stage2_years=5,
+            stage1_growth=g1, stage2_growth=g2,
+            terminal_growth=tg, discount_rate=dr,
+            use_multiple_method=True,
+            terminal_fcf_multiple=terminal_mult,
+            growth_haircut=0.0,
+            iv_haircut=0.0,   # 成长公司不额外打折（已在DR中体现）
+            params_rationale=reasons,
+        )
+
+    # ════════════════════════════════════════
+    # 深度价值：传统制造、银行、零售
+    # 来源：Ben Graham - Graham Number + 保守DCF
+    # ════════════════════════════════════════
+    elif profile.company_type == "value_deep":
+        # 增长：保守，不信历史（价值型公司历史增长不代表未来）
+        g1 = min(hist_g * 0.50, 0.05)   # cap 5%，极度保守
+        g2 = g1 * 0.50
+        tg = 0.02            # 几乎零实际增长
+        dr = 0.11            # 价值公司风险溢价中等
+
+        reasons += [
+            f"增长Stage1={g1:.1%}（历史×0.5，cap5%，Ben Graham极度保守）",
+            f"折现率={dr:.1%}（固定，价值公司不用PE反推）",
+            "同时计算 Graham Number = √(22.5 × EPS × BVPS)",
+            "同时计算 NCAV = 流动资产 - 总负债",
+            "最终IV取 DCF 和 Graham Number 的保守值",
+        ]
+        return ValuationParams(
+            company_type="value_deep",
+            method_name="Graham Number + 保守DCF（Ben Graham）",
+            stage1_years=5, stage2_years=5,
+            stage1_growth=g1, stage2_growth=g2,
+            terminal_growth=tg, discount_rate=dr,
+            use_multiple_method=False,
+            growth_haircut=0.0,
+            iv_haircut=0.20,   # 额外20%保守（Graham强调安全边际）
+            params_rationale=reasons,
+        )
+
+    # ════════════════════════════════════════
+    # 周期型：钢铁、汽车、油气、航运
+    # 来源：标准化盈利（避免周期顶点高估）
+    # ════════════════════════════════════════
+    elif profile.company_type == "cyclical":
+        # 关键：用5-7年平均盈利，不用当年盈利！
+        # 当年可能处于周期顶点或谷底，都会扭曲估值
+        g1 = min(max(hist_g * 0.40, 0.0), 0.06)  # 周期公司增长cap 6%
+        g2 = g1 * 0.30        # 周期公司长期增长很低
+        tg = 0.015            # 接近通胀
+        dr = 0.115            # 周期公司风险溢价较高
+
+        reasons += [
+            f"增长Stage1={g1:.1%}（历史×0.4，cap6%，周期公司不能信历史高点）",
+            f"折现率={dr:.1%}（周期溢价）",
+            f"关键：用{5}年平均OE代替最新OE（避免周期顶点高估）",
+            "终端增长接近通胀（1.5%），周期公司无法持续增长",
+        ]
+        return ValuationParams(
+            company_type="cyclical",
+            method_name="标准化盈利DCF（周期均值回归）",
+            stage1_years=5, stage2_years=5,
+            stage1_growth=g1, stage2_growth=g2,
+            terminal_growth=tg, discount_rate=dr,
+            use_multiple_method=False,
+            normalized_earnings_years=5,   # 用5年均值
+            growth_haircut=0.0,
+            iv_haircut=0.10,
+            params_rationale=reasons,
+        )
+
+    # ════════════════════════════════════════
+    # 财务困境：高杠杆、持续亏损
+    # ════════════════════════════════════════
+    else:  # distressed
+        g1 = max(hist_g * 0.20, -0.05)  # 困境公司增长可能负
+        g2 = 0.0
+        tg = 0.01
+        dr = 0.15  # 高风险溢价
+
+        reasons += [
+            f"困境公司：折现率15%，增长极度保守",
+            "主要看资产清算价值（NCAV）",
+            "DCF结果仅作参考，高度不确定",
+        ]
+        return ValuationParams(
+            company_type="distressed",
+            method_name="资产清算价值优先",
+            stage1_years=5, stage2_years=5,
+            stage1_growth=g1, stage2_growth=g2,
+            terminal_growth=tg, discount_rate=dr,
+            use_multiple_method=False,
+            iv_haircut=0.30,   # 困境公司额外30%折扣
+            params_rationale=reasons,
+        )
 
 
-def report_to_json(report: CompanyReport) -> str:
-    """Serialize report to JSON."""
-    return report.model_dump_json(indent=2)
+# ── 核心估值计算 ───────────────────────────────────────────────────────────────
+
+class SingleScenario(BaseModel):
+    scenario_name: str
+    owner_earnings_used: float
+    params: ValuationParams
+    projected_cash_flows: List[float]
+    terminal_value: float
+    total_pv: float
+    per_share_value: float
+    method_note: str
 
 
-def report_to_markdown(report: CompanyReport) -> str:
-    """Generate Markdown report from CompanyReport."""
-    r = report
-    v = r.valuation
-    m = r.margin_of_safety
-    rec = r.recommendation
-    cs = "¥" if r.currency == "CNY" else "$"
+class ValuationOutput(BaseModel):
+    ticker: str
+    company_profile: CompanyProfile
+    params_used: ValuationParams
 
-    lines = [
-        f"# {r.name} ({r.ticker}) — Investment Analysis Report",
-        f"**Date:** {r.analysis_date}",
-        f"**Recommendation:** {rec.action} | **Position Size:** {rec.position_size} | **Composite Score:** {rec.composite_score:.0f}/100",
-        "",
-    ]
+    # 三场景
+    bull: SingleScenario
+    base: SingleScenario
+    bear: SingleScenario
 
-    if r.currency_note:
-        lines.append(f"**Currency:** {r.currency_note}")
-        lines.append("")
+    # Graham Number（如果适用）
+    graham_number: Optional[float] = None
+    ncav_per_share: Optional[float] = None
 
-    if r.warnings:
-        lines.append("## ⚠️ Warnings")
-        for w in r.warnings:
-            lines.append(f"- {w}")
-        lines.append("")
+    # 标准化OE（周期型）
+    normalized_oe: Optional[float] = None
 
-    # Step 1
-    lines.extend([
-        "---",
-        "## Step 1: Circle of Competence",
-        f"**Score:** {r.competence.score}/100 | **Predictability:** {r.competence.predictability}",
-        "",
-        f"{r.competence.business_model_summary}",
-        "",
-    ])
-    if r.competence.revenue_segments:
-        lines.append("**Revenue Segments:**")
-        for seg in r.competence.revenue_segments:
-            lines.append(f"- {seg.get('segment', 'N/A')}: {seg.get('pct_revenue', 'N/A')}%")
-        lines.append("")
-    if r.competence.complexity_flags:
-        lines.append(f"**Complexity Flags:** {', '.join(r.competence.complexity_flags)}")
-        lines.append("")
-    lines.append(f"**Rationale:** {r.competence.rationale}")
-    lines.append("")
+    # 最终推荐区间
+    iv_low: float          # = bear × (1 - iv_haircut)
+    iv_base: float         # = base × (1 - iv_haircut)
+    iv_high: float         # = bull × (1 - iv_haircut)
+    current_price: float
+    margin_of_safety_pct: float
 
-    # Step 2
-    lines.extend([
-        "---",
-        "## Step 2: Moat Proxy",
-        f"**Score:** {r.moat.score}/100 | **Type:** {r.moat.moat_type} | **Durability:** {r.moat.durability_assessment}",
-        "",
-    ])
-    if r.moat.moat_sources:
-        lines.append("**Moat Sources:**")
-        for ms in r.moat.moat_sources:
-            lines.append(f"- **{ms.source}**: {ms.strength}/100 — {ms.evidence}")
-        lines.append("")
-    mt = r.moat.margin_trend
-    if mt:
-        lines.append(f"**Margin Trends:** Gross {mt.get('gross_margin_5yr_trend', 'N/A')}, Operating {mt.get('operating_margin_5yr_trend', 'N/A')}")
-        lines.append("")
-    lines.append(f"**Rationale:** {r.moat.rationale}")
-    lines.append("")
+    evidence: List[str]
 
-    # Step 3
-    fq = r.financial_quality
-    lines.extend([
-        "---",
-        "## Step 3: Financial Quality",
-        f"**Score:** {fq.score}/100",
-        "",
-    ])
-    metrics = fq.metrics
-    lines.append("**Key Metrics:**")
-    for key in ["roe_avg_5yr", "roic_avg_5yr", "debt_to_equity_current",
-                 "interest_coverage", "fcf_to_net_income_avg", "gross_margin_avg",
-                 "operating_margin_avg", "capex_to_revenue_avg"]:
-        val = metrics.get(key, "N/A")
-        label = key.replace("_", " ").title()
-        if isinstance(val, float):
-            lines.append(f"- {label}: {val:.2f}")
-        else:
-            lines.append(f"- {label}: {val}")
-    lines.append("")
-    if fq.flags:
-        lines.append(f"**Flags:** {', '.join(fq.flags)}")
-        lines.append("")
-    lines.append(f"**Rationale:** {fq.rationale}")
-    lines.append("")
 
-    # Step 4
-    s = r.stability
-    lines.extend([
-        "---",
-        "## Step 4: Stability",
-        f"**Score:** {s.score}/100",
-        "",
-        f"- Revenue CAGR (5yr): {s.revenue_cagr_5yr}%"
-        if s.revenue_cagr_5yr is not None else "- Revenue CAGR (5yr): N/A",
-        f"- Revenue CAGR (10yr): {s.revenue_cagr_10yr}%"
-        if s.revenue_cagr_10yr is not None else "- Revenue CAGR (10yr): N/A",
-        f"- Earnings CAGR (5yr): {s.earnings_cagr_5yr}%"
-        if s.earnings_cagr_5yr is not None else "- Earnings CAGR (5yr): N/A",
-        f"- Revenue Volatility (CoV): {s.revenue_volatility}" if s.revenue_volatility else "- Revenue Volatility: N/A",
-        f"- Earnings Volatility (CoV): {s.earnings_volatility}" if s.earnings_volatility else "- Earnings Volatility: N/A",
-        f"- Consecutive Profit Years: {s.consecutive_profit_years}",
-        f"- Dividend Consistency: {s.dividend_consistency}",
-        f"- Revenue Trend R²: {s.regression_r_squared}" if s.regression_r_squared else "- Revenue Trend R²: N/A",
-        "",
-        f"**Rationale:** {s.rationale}",
-        "",
-    ])
+def run_per_company_valuation(
+    ticker: str,
+    financial_history,          # FinancialHistory
+    market_data,                # MarketAnchorData（可为None）
+) -> ValuationOutput:
+    """
+    主入口：根据公司特征自动选择估值方法。
+    """
+    stmts = financial_history.statements
+    if not stmts or len(stmts) < 2:
+        raise RuntimeError(f"财务数据不足，无法估值：{ticker}")
 
-    # Step 5
-    lines.extend([
-        "---",
-        "## Step 5: Intrinsic Value",
-        "",
-        "| Scenario | Per Share IV | Growth | Discount | Terminal Growth |",
-        "|----------|-------------|--------|----------|-----------------|",
-        f"| **Bull** | {cs}{v.bull.per_share_value:,.2f} | {v.bull.growth_rate:.1%} | {v.bull.discount_rate:.0%} | {v.bull.terminal_growth_rate:.0%} |",
-        f"| **Base** | {cs}{v.base.per_share_value:,.2f} | {v.base.growth_rate:.1%} | {v.base.discount_rate:.0%} | {v.base.terminal_growth_rate:.0%} |",
-        f"| **Bear** | {cs}{v.bear.per_share_value:,.2f} | {v.bear.growth_rate:.1%} | {v.bear.discount_rate:.0%} | {v.bear.terminal_growth_rate:.0%} |",
-        "",
-        f"**EPV Sanity Check:** {cs}{v.epv_per_share:,.2f}/share",
-        f"**Current Price:** {cs}{v.current_price:,.2f}",
-        "",
-        f"**Maintenance CapEx:** {v.base.maintenance_capex_method}",
-        "",
-    ])
+    price = financial_history.current_price
+    shares = financial_history.shares_outstanding
+    evidence = []
 
-    # Sensitivity table
-    if v.sensitivity_table:
-        lines.append("**Sensitivity Table (Base scenario, varying discount & terminal growth):**")
-        lines.append("")
-        lines.append("| Discount Rate | TG 2% | TG 3% | TG 4% |")
-        lines.append("|---------------|-------|-------|-------|")
-        for row in v.sensitivity_table:
-            lines.append(
-                f"| {row['discount_rate']:.0%} | "
-                f"{cs}{row.get('tg_2%', 0):,.2f} | "
-                f"{cs}{row.get('tg_3%', 0):,.2f} | "
-                f"{cs}{row.get('tg_4%', 0):,.2f} |"
-            )
-        lines.append("")
+    # ── 1. 计算基础指标 ────────────────────────────────────────────────────────
+    rev_cagr = _cagr([s.revenue for s in stmts], years=min(5, len(stmts)-1))
+    earn_cagr = _cagr([s.net_income for s in stmts], years=min(5, len(stmts)-1))
+    gross_margins = [s.gross_profit / s.revenue for s in stmts if s.revenue > 0]
+    gm_avg = sum(gross_margins) / len(gross_margins) if gross_margins else 0
+    roes = [s.net_income / s.total_equity for s in stmts if s.total_equity > 0]
+    roe_avg = sum(roes) / len(roes) if roes else 0
+    latest = stmts[-1]
+    de_ratio = latest.total_debt / max(latest.total_equity, 1)
+    fcf_pos = sum(1 for s in stmts[-5:] if s.free_cash_flow > 0)
+    ni_pos = sum(1 for s in stmts[-5:] if s.net_income > 0)
 
-    lines.append(f"**Rationale:** {v.rationale}")
-    lines.append("")
+    # R&D 占比
+    rd_vals = [s.research_and_development for s in stmts if s.research_and_development]
+    rev_vals = [s.revenue for s in stmts if s.revenue > 0]
+    rd_ratio = (sum(rd_vals[-3:]) / 3) / (sum(rev_vals[-3:]) / 3) if rd_vals and rev_vals else 0
 
-    # Step 6
-    lines.extend([
-        "---",
-        "## Step 6: Margin of Safety",
-        f"**Score:** {m.score}/100 | **Verdict:** {m.verdict}",
-        "",
-        f"- Current Price: {cs}{m.current_price:,.2f}",
-        f"- Base Intrinsic Value: {cs}{m.base_intrinsic_value:,.2f}",
-        f"- Margin of Safety: {m.margin_of_safety_pct:.1f}%",
-        f"- Bull Upside: {m.bull_upside_pct:.1f}%",
-        f"- Bear Downside: {m.bear_downside_pct:.1f}%",
-        "",
-        f"**Rationale:** {m.rationale}",
-        "",
-    ])
+    # 营收波动
+    revs = [s.revenue for s in stmts if s.revenue > 0]
+    rev_cov = _cov(revs) if len(revs) >= 3 else 0
 
-    # Final Recommendation
-    lines.extend([
-        "---",
-        "## Final Recommendation",
-        f"### {rec.action} — {rec.position_size} Position",
-        f"**Composite Score:** {rec.composite_score:.0f}/100",
-        "",
-        "**Score Breakdown:**",
-    ])
-    for k, v_score in rec.score_breakdown.items():
-        w = config.WEIGHTS.get(k, 0)
-        lines.append(f"- {k.replace('_', ' ').title()}: {v_score}/100 (weight: {w:.0%})")
-    lines.extend([
-        "",
-        f"**Bull Case:** {rec.bull_case}",
-        "",
-        f"**Bear Case:** {rec.bear_case}",
-        "",
-        "**Monitoring Metrics:**",
-    ])
-    for metric in rec.monitoring_metrics:
-        lines.append(f"- {metric}")
+    evidence.append(f"营收CAGR5yr={rev_cagr:.1%}，毛利均值={gm_avg:.1%}，ROE均值={roe_avg:.1%}")
+    evidence.append(f"D/E={de_ratio:.2f}，FCF正年数={fcf_pos}/5，R&D占比={rd_ratio:.1%}，营收波动CoV={rev_cov:.2f}")
 
-    # Validation
-    if r.validation_issues:
-        lines.extend(["", "---", "## ✅ Validation"])
-        lines.append(f"**{r.validation_summary}**")
-        lines.append("")
-        errors = [i for i in r.validation_issues if i.get("severity") == "error"]
-        warns = [i for i in r.validation_issues if i.get("severity") == "warning"]
-        if errors:
-            lines.append("**Errors:**")
-            for e in errors:
-                lines.append(f"- ❌ [{e.get('category','')}] {e.get('message','')}")
-        if warns:
-            lines.append("**Warnings:**")
-            for w in warns:
-                lines.append(f"- ⚠️ [{w.get('category','')}] {w.get('message','')}")
-        lines.append("")
+    # ── 2. 公司分类 ────────────────────────────────────────────────────────────
+    profile = classify_company(
+        revenue_cagr_5yr=rev_cagr,
+        gross_margin_avg=gm_avg,
+        roe_avg=roe_avg,
+        debt_to_equity=de_ratio,
+        fcf_positive_years=fcf_pos,
+        rd_to_revenue=rd_ratio,
+        revenue_volatility_cov=rev_cov,
+        net_income_positive_years=ni_pos,
+    )
+    evidence.append(f"公司分类：{profile.company_type} — {profile.classification_rationale}")
 
-    lines.extend(["", "---", f"*Report generated {r.analysis_date}*"])
+    # ── 3. 市场数据提取 ────────────────────────────────────────────────────────
+    market_pe = None
+    analyst_fwd_growth = None
+    market_implied_growth = None
 
-    return "\n".join(lines)
+    if market_data:
+        market_pe = market_data.trailing_pe or market_data.forward_pe
+        analyst_fwd_growth = market_data.forward_eps_growth
+        # Reverse DCF 反推隐含增长（简化）
+        if market_pe and market_pe > 0:
+            # implied growth ≈ PE/(PE+1) 粗略，更精确版在 market_anchor.py
+            market_implied_growth = min(1 / market_pe * 1.5, 0.30)
+
+    # ── 4. 获取专属估值参数 ────────────────────────────────────────────────────
+    params = get_valuation_params(
+        profile=profile,
+        market_implied_growth=market_implied_growth,
+        analyst_forward_growth=analyst_fwd_growth,
+        market_pe=market_pe,
+    )
+    for r in params.params_rationale:
+        evidence.append(r)
+
+    # ── 5. 计算 Owner Earnings（或标准化版本） ──────────────────────────────────
+    raw_oe, maint_capex, maint_note = _compute_oe(latest)
+    evidence.append(f"最新OE={raw_oe/1e9:.2f}B，维护CapEx={maint_capex/1e9:.2f}B（{maint_note}）")
+
+    # 周期型：用标准化OE（多年均值）
+    if profile.company_type == "cyclical":
+        norm_oe = _normalized_oe(stmts, maint_capex, years=params.normalized_earnings_years)
+        base_oe = norm_oe
+        evidence.append(f"标准化OE（{params.normalized_earnings_years}年均值）={norm_oe/1e9:.2f}B（替代最新OE）")
+    else:
+        norm_oe = None
+        base_oe = raw_oe
+
+    # ── 6. Graham Number（深度价值型） ────────────────────────────────────────
+    graham_number = None
+    ncav_ps = None
+    if profile.company_type in ("value_deep", "distressed"):
+        eps = latest.net_income / shares if shares > 0 else 0
+        bvps = latest.total_equity / shares if shares > 0 else 0
+        if eps > 0 and bvps > 0:
+            graham_number = math.sqrt(22.5 * eps * bvps)
+            evidence.append(f"Graham Number = √(22.5 × EPS{eps:.2f} × BVPS{bvps:.2f}) = ${graham_number:.2f}")
+        ncav = latest.total_assets - latest.total_liabilities  # 简化版
+        ncav_ps = ncav / shares if shares > 0 else 0
+        evidence.append(f"NCAV/股 = ${ncav_ps:.2f}（流动资产 - 总负债估算）")
+
+    # ── 7. 三场景估值 ─────────────────────────────────────────────────────────
+    bull_scenario = _run_single_scenario(
+        name="bull", base_oe=base_oe,
+        g1=params.stage1_growth * 1.35,
+        g2=params.stage2_growth * 1.35,
+        tg=params.terminal_growth + 0.005,
+        dr=params.discount_rate * 0.92,
+        years1=params.stage1_years, years2=params.stage2_years,
+        shares=shares,
+        use_multiple=params.use_multiple_method,
+        terminal_multiple=params.terminal_fcf_multiple * 1.2,
+        margin_compression=0.0,
+    )
+
+    base_scenario = _run_single_scenario(
+        name="base", base_oe=base_oe,
+        g1=params.stage1_growth,
+        g2=params.stage2_growth,
+        tg=params.terminal_growth,
+        dr=params.discount_rate,
+        years1=params.stage1_years, years2=params.stage2_years,
+        shares=shares,
+        use_multiple=params.use_multiple_method,
+        terminal_multiple=params.terminal_fcf_multiple,
+        margin_compression=0.03,
+    )
+
+    bear_scenario = _run_single_scenario(
+        name="bear", base_oe=base_oe,
+        g1=params.stage1_growth * 0.40,
+        g2=params.stage2_growth * 0.30,
+        tg=max(params.terminal_growth - 0.01, 0.005),
+        dr=params.discount_rate * 1.15,
+        years1=params.stage1_years, years2=params.stage2_years,
+        shares=shares,
+        use_multiple=params.use_multiple_method,
+        terminal_multiple=params.terminal_fcf_multiple * 0.6,
+        margin_compression=0.15,
+    )
+
+    # ── 8. 应用 IV haircut + Graham Number 对比 ────────────────────────────────
+    h = params.iv_haircut
+    iv_bull = bull_scenario.per_share_value * (1 - h)
+    iv_base = base_scenario.per_share_value * (1 - h)
+    iv_bear = bear_scenario.per_share_value * (1 - h)
+
+    # 深度价值：取 DCF 和 Graham Number 的更低值（更保守）
+    if graham_number and profile.company_type == "value_deep":
+        iv_base = min(iv_base, graham_number)
+        evidence.append(f"深度价值：取 DCF({base_scenario.per_share_value:.0f}×{1-h}) 和 Graham Number(${graham_number:.0f}) 的较低值 → ${iv_base:.0f}")
+
+    mos = (iv_base - price) / iv_base * 100 if iv_base > 0 else 0
+    evidence.append(f"最终估值区间：${iv_bear:.0f}–${iv_base:.0f}–${iv_bull:.0f}，安全边际={mos:.1f}%")
+
+    # ── 9. 组装输出 ────────────────────────────────────────────────────────────
+    bull_scenario.params = params
+    base_scenario.params = params
+    bear_scenario.params = params
+
+    return ValuationOutput(
+        ticker=ticker,
+        company_profile=profile,
+        params_used=params,
+        bull=bull_scenario,
+        base=base_scenario,
+        bear=bear_scenario,
+        graham_number=round(graham_number, 2) if graham_number else None,
+        ncav_per_share=round(ncav_ps, 2) if ncav_ps else None,
+        normalized_oe=round(norm_oe, 2) if norm_oe else None,
+        iv_low=round(iv_bear, 2),
+        iv_base=round(iv_base, 2),
+        iv_high=round(iv_bull, 2),
+        current_price=round(price, 2),
+        margin_of_safety_pct=round(mos, 2),
+        evidence=evidence,
+    )
+
+
+# ── 辅助函数 ───────────────────────────────────────────────────────────────────
+
+def _run_single_scenario(
+    name: str,
+    base_oe: float,
+    g1: float, g2: float, tg: float, dr: float,
+    years1: int, years2: int,
+    shares: float,
+    use_multiple: bool,
+    terminal_multiple: float,
+    margin_compression: float,
+) -> SingleScenario:
+    g1 = min(max(g1, -0.05), 0.40)
+    g2 = min(max(g2, -0.03), 0.30)
+
+    oe = base_oe * (1 - margin_compression)
+    cfs = []
+    pv = 0.0
+    cur = oe
+
+    # Stage 1
+    for t in range(1, years1 + 1):
+        cur *= (1 + g1)
+        pv += cur / (1 + dr) ** t
+        cfs.append(round(cur, 2))
+
+    # Stage 2
+    for t in range(1, years2 + 1):
+        cur *= (1 + g2)
+        tt = years1 + t
+        pv += cur / (1 + dr) ** tt
+        cfs.append(round(cur, 2))
+
+    # Terminal
+    if use_multiple:
+        terminal = cur * terminal_multiple
+    else:
+        terminal = cur * (1 + tg) / max(dr - tg, 0.001)
+
+    total_years = years1 + years2
+    pv_terminal = terminal / (1 + dr) ** total_years
+    total_pv = pv + pv_terminal
+    per_share = total_pv / shares if shares > 0 else 0
+
+    return SingleScenario(
+        scenario_name=name,
+        owner_earnings_used=round(oe, 2),
+        params=ValuationParams(company_type="mature_quality", method_name="temp",
+                               stage1_growth=g1, stage2_growth=g2,
+                               terminal_growth=tg, discount_rate=dr),
+        projected_cash_flows=cfs,
+        terminal_value=round(terminal, 2),
+        total_pv=round(total_pv, 2),
+        per_share_value=round(per_share, 2),
+        method_note=f"{'倍数法' if use_multiple else 'Gordon增长'}, DR={dr:.1%}, g1={g1:.1%}, g2={g2:.1%}, TV×{terminal_multiple:.0f}" if use_multiple else f"DR={dr:.1%}, g1={g1:.1%}, g2={g2:.1%}, tg={tg:.1%}",
+    )
+
+
+def _compute_oe(stmt) -> tuple[float, float, str]:
+    ni = stmt.net_income
+    da = stmt.depreciation_amortization
+    capex = abs(stmt.capital_expenditure)
+    maint = da * 1.0  # 保守：D&A = 维护CapEx
+    wc = getattr(stmt, 'change_in_working_capital', 0) or 0
+    oe = max(ni + da - maint - wc, 0)
+    return oe, maint, f"D&A法({da/1e6:.0f}M)"
+
+
+def _normalized_oe(stmts, maint_capex: float, years: int) -> float:
+    """周期型公司：用多年均值OE"""
+    recent = stmts[-years:] if len(stmts) >= years else stmts
+    vals = []
+    for s in recent:
+        oe = max(s.net_income + s.depreciation_amortization - maint_capex, 0)
+        vals.append(oe)
+    return sum(vals) / len(vals) if vals else 0
+
+
+def _cagr(values: list, years: int) -> float:
+    if years <= 0 or len(values) < 2:
+        return 0.0
+    start = values[max(0, len(values)-years-1)]
+    end = values[-1]
+    if start <= 0 or end <= 0:
+        return 0.0
+    try:
+        return (end / start) ** (1 / years) - 1
+    except Exception:
+        return 0.0
+
+
+def _cov(values: list) -> float:
+    if len(values) < 2:
+        return 0.0
+    mean = sum(values) / len(values)
+    if mean == 0:
+        return 0.0
+    variance = sum((v - mean) ** 2 for v in values) / len(values)
+    return math.sqrt(variance) / abs(mean)
+
+
+def _dr_from_pe(pe: Optional[float], lo: float, hi: float, default: float) -> float:
+    """从市场PE反推折现率，约束在合理区间"""
+    if not pe or pe <= 0:
+        return default
+    implied = 1.0 / pe + 0.025  # earnings yield + terminal growth
+    return round(min(max(implied, lo), hi), 4)
+
+
+def _blend_growth(hist_g: float, analyst_g: Optional[float], weight_analyst: float) -> float:
+    """融合历史增长和analyst预期"""
+    if analyst_g is None:
+        return hist_g
+    w_hist = 1.0 - weight_analyst
+    return hist_g * w_hist + analyst_g * weight_analyst
+
+
+def _growth_terminal_multiple(g1: float) -> float:
+    """
+    成长公司终端倍数：根据增速动态计算
+    g1 >= 30%: 35x（超高增长）
+    g1 >= 20%: 28x
+    g1 >= 15%: 22x
+    g1 < 15%: 18x
+    """
+    if g1 >= 0.30:
+        return 35.0
+    elif g1 >= 0.20:
+        return 28.0
+    elif g1 >= 0.15:
+        return 22.0
+    else:
+        return 18.0
